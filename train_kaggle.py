@@ -48,7 +48,7 @@ OFFICIAL_SPLIT_URLS = {
     "lsui": "https://raw.githubusercontent.com/ddz16/UIE_Benckmark/main/data/LSUI/test.txt",
 }
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-DEFAULT_SCAN_MODE = "astar"
+DEFAULT_SCAN_MODE = "mambairv2"
 
 
 # ---------------------------------------------------------------------------

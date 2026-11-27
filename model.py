@@ -1,258 +1,263 @@
+"""
+D2Mamba Research — Branch 1: exp/1-mambairv2-gpu-scan
+100% GPU-native MambaIRv2-inspired Semantic-Guided Single Scan (SGN + prompt-augmented ASE)
+with exact pure-PyTorch chunked SSD scan (zero CPU heapq, zero .cpu()/.numpy(), zero mamba-ssm).
+"""
+
+import math
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import heapq
-import math
-import time
-import os
-import numpy as np
-import matplotlib.pyplot as plt
 
-# --- 1. Standalone Mamba Block Implementation (Unchanged) ---
-class MambaBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+
+# ---------------------------------------------------------------------------
+# 1. Pure-PyTorch Exact Chunked SSD Scan (Mamba-2 Duality, 100% GPU & JIT-Safe)
+# ---------------------------------------------------------------------------
+@torch.jit.script
+def _invert_permutation(order: torch.Tensor) -> torch.Tensor:
+    """Compute exact inverse permutation on GPU in O(L) with zero CPU sync.
+    Args:
+        order: (B, L) int64 permutation indices.
+    Returns:
+        inv_order: (B, L) int64 such that gather(gather(x, order), inv_order) == x.
+    """
+    B, L = order.shape
+    arange = torch.arange(L, device=order.device, dtype=order.dtype).unsqueeze(0).expand(B, L)
+    inv_order = torch.empty_like(order)
+    inv_order.scatter_(1, order, arange)
+    return inv_order
+
+
+@torch.jit.script
+def _inter_chunk_scan(chunk_decay: torch.Tensor, chunk_states: torch.Tensor) -> torch.Tensor:
+    """Exact Hillis-Steele associative prefix scan over chunks.
+    Computes exclusive carried states H_{m-1} where H_m = chunk_decay[m] * H_{m-1} + chunk_states[m].
+    Since chunk_decay in (0, 1], this never overflows in FP32.
+
+    Args:
+        chunk_decay: (B, H, M) float32 in (0, 1]
+        chunk_states: (B, H, M, P, N) float32
+    Returns:
+        prev_states: (B, H, M, P, N) float32 with prev_states[:, :, 0] == 0
+    """
+    M = chunk_decay.shape[2]
+    a = chunk_decay
+    u = chunk_states
+    stride = 1
+    while stride < M:
+        a_prev = a[:, :, :-stride]
+        a_curr = a[:, :, stride:]
+        u_prev = u[:, :, :-stride]
+        u_curr = u[:, :, stride:]
+        u_upd = a_curr.unsqueeze(-1).unsqueeze(-1) * u_prev + u_curr
+        a_upd = a_curr * a_prev
+        u = torch.cat([u[:, :, :stride], u_upd], dim=2)
+        a = torch.cat([a[:, :, :stride], a_upd], dim=2)
+        stride = stride * 2
+
+    zeros = torch.zeros_like(u[:, :, :1])
+    if M > 1:
+        return torch.cat([zeros, u[:, :, :-1]], dim=2)
+    return zeros
+
+
+@torch.jit.script
+def chunked_ssd_scan(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B_param: torch.Tensor,
+    C_param: torch.Tensor,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Exact pure-PyTorch multi-head scalar-decay Structured State Space Duality (SSD) scan.
+    Solves h_t = exp(dt_t * A) * h_{t-1} + dt_t * B_t (x) x_t, y_t = <h_t, C_t> exactly.
+    All exponentials & cumulative sums are computed strictly in float32 for AMP safety.
+
+    Args:
+        x: (B, L, H, P)
+        dt: (B, L, H) strictly positive
+        A: (H,) strictly negative
+        B_param: (B, L, H, N)
+        C_param: (B, L, H, N)
+        chunk_size: int (default 64)
+    Returns:
+        y: (B, L, H, P) in x.dtype
+    """
+    orig_dtype = x.dtype
+    B_sz, L, H, P = x.shape
+    N = B_param.shape[-1]
+
+    # Dynamic padding to multiple of chunk_size
+    rem = L % chunk_size
+    pad_len = (chunk_size - rem) if rem != 0 else 0
+    if pad_len > 0:
+        x = F.pad(x, (0, 0, 0, 0, 0, pad_len))
+        dt = F.pad(dt, (0, 0, 0, pad_len))
+        B_param = F.pad(B_param, (0, 0, 0, 0, 0, pad_len))
+        C_param = F.pad(C_param, (0, 0, 0, 0, 0, pad_len))
+
+    L_pad = x.shape[1]
+    M = L_pad // chunk_size
+    Q = chunk_size
+
+    # Reshape to (B, H, M, Q, ...) in float32 for numerical stability
+    dt_f = dt.float().permute(0, 2, 1).reshape(B_sz, H, M, Q)
+    x_f = x.float().permute(0, 2, 1, 3).reshape(B_sz, H, M, Q, P)
+    B_f = B_param.float().permute(0, 2, 1, 3).reshape(B_sz, H, M, Q, N)
+    C_f = C_param.float().permute(0, 2, 1, 3).reshape(B_sz, H, M, Q, N)
+
+    # Log-decay per step: log_a <= 0 ALWAYS since dt > 0 and A < 0
+    log_a = dt_f * A.float().view(1, H, 1, 1)
+    log_a = torch.clamp(log_a, max=0.0)
+    cum_log_a = torch.cumsum(log_a, dim=-1)  # (B, H, M, Q) <= 0
+
+    # 1. Intra-chunk 1-semiseparable lower-triangular decay matrix L_mat
+    # For i >= j: cum_log_a[i] - cum_log_a[j] <= 0 -> exp(...) in (0, 1], zero overflow!
+    diff = cum_log_a.unsqueeze(-1) - cum_log_a.unsqueeze(-2)  # (B, H, M, Q, Q)
+    tril_mask = torch.tril(torch.ones((Q, Q), device=x.device, dtype=torch.bool))
+    diff_safe = torch.where(tril_mask, diff.clamp(max=0.0), torch.full_like(diff, -1e9))
+    L_mat = torch.exp(diff_safe) * tril_mask.to(diff.dtype)
+
+    x_scaled = x_f * dt_f.unsqueeze(-1)  # (B, H, M, Q, P)
+    CB = torch.matmul(C_f, B_f.transpose(-1, -2))  # (B, H, M, Q, Q)
+    Y_diag = torch.matmul(L_mat * CB, x_scaled)  # (B, H, M, Q, P)
+
+    # 2. Local chunk end-states H_local: (B, H, M, P, N)
+    decay_to_end = torch.exp((cum_log_a[:, :, :, -1:] - cum_log_a).clamp(max=0.0))
+    B_decayed = B_f * decay_to_end.unsqueeze(-1)
+    H_local = torch.matmul(x_scaled.transpose(-1, -2), B_decayed)
+
+    # 3. Inter-chunk associative scan across M chunks
+    chunk_decay = torch.exp(cum_log_a[:, :, :, -1].clamp(max=0.0))  # (B, H, M)
+    H_prev = _inter_chunk_scan(chunk_decay, H_local)  # (B, H, M, P, N)
+
+    # 4. Cross-chunk off-diagonal contribution
+    decay_from_start = torch.exp(cum_log_a.clamp(max=0.0))  # (B, H, M, Q)
+    C_decayed = C_f * decay_from_start.unsqueeze(-1)
+    Y_off = torch.matmul(C_decayed, H_prev.transpose(-1, -2))  # (B, H, M, Q, P)
+
+    Y = (Y_diag + Y_off).reshape(B_sz, H, L_pad, P).permute(0, 2, 1, 3)  # (B, L_pad, H, P)
+    if pad_len > 0:
+        Y = Y[:, :L]
+    return Y.to(orig_dtype)
+
+
+# ---------------------------------------------------------------------------
+# 2. MambaIRv2-Inspired Attentive State-Space Block (ASE)
+# ---------------------------------------------------------------------------
+class ASEMambaBlock(nn.Module):
+    """
+    Attentive State-Space Block with Prompt-Augmented C-Projection (ASE).
+    Uses exact pure-PyTorch chunked SSD scan without 1D conv1d across reordered tokens
+    (2D local neighborhoods are preserved beforehand by a 2D depthwise pre-conv).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        expand: int = 2,
+        num_heads: int = 4,
+        num_prompts: int = 16,
+        chunk_size: int = 64,
+    ):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
-        self.d_conv = d_conv
         self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
+        self.d_inner = int(expand * d_model)
+        self.num_heads = num_heads
+        assert self.d_inner % num_heads == 0, f"d_inner ({self.d_inner}) must be divisible by num_heads ({num_heads})"
+        self.head_dim = self.d_inner // num_heads
+        self.num_prompts = num_prompts
+        self.chunk_size = chunk_size
 
-        # Projects input x to a higher dimension for main processing (x) and gating (z)
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2)
-        
-        # 1D causal convolution to capture local context
-        self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            kernel_size=d_conv,
-            padding=d_conv - 1,
-            groups=self.d_inner,
-        )
-        
-        # Projects convoluted x to get the dynamic SSM parameters (dt, B, C)
-        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2 + self.d_inner)
-        
-        # Specific projection for the timestep parameter dt
-        self.dt_proj = nn.Linear(self.d_state, self.d_inner)
+        self.norm = nn.LayerNorm(d_model)
+        # Keep in_proj, D, out_proj names & shapes compatible with official D2Mamba ckpt!
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2)
 
-        # Learnable parameters for the SSM state matrix A and feedthrough matrix D
-        A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
+        # Dynamic SSM projections: dt (H), B (H*N), C_base (H*N)
+        self.ssm_proj = nn.Linear(self.d_inner, num_heads + 2 * num_heads * d_state)
+
+        # Well-conditioned dt bias (inverse softplus of [0.01 .. 0.1])
+        dt_init = torch.exp(torch.linspace(math.log(0.01), math.log(0.1), num_heads))
+        inv_dt = dt_init + torch.log(-torch.expm1(-dt_init))
+        self.dt_bias = nn.Parameter(inv_dt)
+
+        # Per-head log decay rate A = -exp(A_log)
+        self.A_log = nn.Parameter(torch.log(torch.linspace(0.5, 4.0, num_heads)))
         self.D = nn.Parameter(torch.ones(self.d_inner))
-        
-        # Projects the final output back to the original model dimension
-        self.out_proj = nn.Linear(self.d_inner, self.d_model)
 
-    def forward(self, x):
+        # ASE Prompt Pool augmenting C-projection for non-causal semantic retrieval in 1 scan
+        self.prompt_pool = nn.Parameter(torch.randn(num_prompts, num_heads * d_state) * 0.02)
+        self.prompt_scale = nn.Parameter(torch.tensor(0.5))
+
+        self.out_proj = nn.Linear(self.d_inner, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        prompt_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Implements the Mamba forward pass using the optimized parallel scan.
+        Args:
+            x: (B, L, d_model)
+            prompt_weights: optional (B, L, num_prompts) soft semantic routing distribution
         """
-        B, L, d_model = x.shape
-        
-        xz = self.in_proj(x)
-        x, z = xz.chunk(2, dim=-1)
-        
-        x = x.transpose(1, 2)
-        x = self.conv1d(x)[:, :, :L]
-        x = x.transpose(1, 2)
-        x = F.silu(x)
+        residual = x
+        x_norm = self.norm(x)
+        B_sz, L, _ = x_norm.shape
 
-        x_proj_out = self.x_proj(x)
-        dt, B_param, C_param = x_proj_out.split([self.d_state, self.d_state, self.d_inner], dim=-1)
+        xz = self.in_proj(x_norm)
+        u, z = xz.chunk(2, dim=-1)
+        u = F.silu(u)
 
-        y = self.ssm_scan(x, dt, B_param, C_param)
-        
-        y = y + x * self.D
+        proj = self.ssm_proj(u)
+        hn = self.num_heads * self.d_state
+        dt_raw, B_flat, C_flat = proj.split([self.num_heads, hn, hn], dim=-1)
+
+        # Compute positive dt strictly in float32
+        dt = F.softplus(dt_raw.float() + self.dt_bias.float())  # (B, L, H)
+        A = -torch.exp(self.A_log.float())  # (H,) < 0
+
+        B_param = B_flat.view(B_sz, L, self.num_heads, self.d_state)
+        C_param = C_flat.view(B_sz, L, self.num_heads, self.d_state)
+
+        # Prompt-augmented C-projection (ASE)
+        if prompt_weights is not None:
+            prompt_c = torch.matmul(prompt_weights.to(self.prompt_pool.dtype), self.prompt_pool)
+            prompt_c = prompt_c.view(B_sz, L, self.num_heads, self.d_state)
+            C_param = C_param + self.prompt_scale * prompt_c.to(C_param.dtype)
+
+        u_heads = u.view(B_sz, L, self.num_heads, self.head_dim)
+        y_heads = chunked_ssd_scan(u_heads, dt, A, B_param, C_param, self.chunk_size)
+        y = y_heads.reshape(B_sz, L, self.d_inner)
+
+        y = y + u * self.D
         y = y * F.silu(z)
-        output = self.out_proj(y)
-        return output
+        out = self.out_proj(y)
+        return residual + out
 
-    def ssm_scan(self, x, dt, B, C):
-        """
-        Performs the parallel scan algorithm.
-        """
-        # Discretize continuous-time SSM parameters
-        dt = F.softplus(self.dt_proj(dt))
-        A = -torch.exp(self.A_log.float())
-        
-        dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
-        dB = dt.unsqueeze(-1) * B.unsqueeze(-2)
-        
-        log_dA = torch.log(dA + 1e-8)
-        d_log_scan = torch.cumsum(log_dA, dim=1)
-        dBx = dB * x.unsqueeze(-1)
-        
-        d_log_scan_shifted = F.pad(d_log_scan[:, :-1], (0, 0, 0, 0, 1, 0), "constant", 0)
-        scan_term = torch.exp(d_log_scan_shifted) * dBx
-        h = torch.cumsum(scan_term, dim=1)
 
-        y = (h * C.unsqueeze(-1)).sum(-1)
-        return y
-
-# --- 2. A* Pathfinding Module with STABILIZED Cost and GIFH ---
-class GeodesicInformationFieldHeuristic(nn.Module):
-    """
-    Implements the Geodesic Information-Field Heuristic (GIFH).
-    This module computes a learnable, physics-inspired heuristic for the A* search.
-    """
-    def __init__(self, feature_dim, variance_kernel_size=3):
-        super().__init__()
-        self.delta = nn.Parameter(torch.tensor(0.1))
-        self.gamma = nn.Parameter(torch.tensor(1.0))
-        self.beta = nn.Parameter(torch.tensor(1.0))
-        
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 4),
-            nn.ReLU(),
-            nn.Linear(feature_dim // 4, 1),
-            nn.Sigmoid()
-        )
-        
-        self.kernel_size = variance_kernel_size
-        self.padding = variance_kernel_size // 2
-        self.avg_pool = nn.AvgPool2d(kernel_size=self.kernel_size, stride=1, padding=self.padding)
-
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
-        self.sobel = nn.Parameter(torch.cat([sobel_x, sobel_y], dim=0), requires_grad=False)
-
-    def precompute(self, features, end_node):
-        """
-        Calculates the heuristic cost grid for a given feature map.
-        """
-        H, W, C = features.shape
-        all_feats = features.reshape(H * W, C)
-        
-        C_lf = C // 2
-        feats_lf = all_feats[:, :C_lf]
-        feats_hf = all_feats[:, C_lf:]
-        
-        features_permuted = features.permute(2, 0, 1)
-        grad = F.conv2d(features_permuted.unsqueeze(1), self.sobel.to(features.device), padding=1)
-        grad_mag = torch.norm(grad, p=2, dim=1)
-        geodesic_grid = torch.mean(grad_mag, dim=0)
-
-        feats_hf_permuted = feats_hf.reshape(H, W, -1).permute(2, 0, 1).unsqueeze(0)
-        mean_sq_hf = self.avg_pool(feats_hf_permuted**2)
-        sq_mean_hf = self.avg_pool(feats_hf_permuted)**2
-        var_hf = torch.sum(mean_sq_hf - sq_mean_hf, dim=1).squeeze(0)
-        info_goal_hf = var_hf[end_node[0], end_node[1]]
-        scattering_cost_grid = (info_goal_hf - var_hf)
-        
-        end_feat_lf = feats_lf.reshape(H, W, -1)[end_node[0], end_node[1]].unsqueeze(0)
-        absorption_cost_grid = torch.norm(feats_lf - end_feat_lf, p=2, dim=1).reshape(H, W)
-
-        omega_grid = self.gate_mlp(all_feats).reshape(H, W)
-
-        delta_pos = F.softplus(self.delta)
-        gamma_pos = F.softplus(self.gamma)
-        beta_pos = F.softplus(self.beta)
-        
-        heuristic_grid = (delta_pos * geodesic_grid) + \
-                         (omega_grid * gamma_pos * scattering_cost_grid) + \
-                         ((1 - omega_grid) * beta_pos * absorption_cost_grid)
-        
-        return F.relu(heuristic_grid)
-
-class AStarPathfinder(nn.Module):
-    """
-    Implements A* search with a fixed Affinity Cost and a learnable heuristic.
-    """
-    def __init__(self, feature_dim):
-        super().__init__()
-        self.heuristic_calculator = GeodesicInformationFieldHeuristic(feature_dim)
-        self.directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-        self.dir_to_idx = {d: i for i, d in enumerate(self.directions)}
-
-    def get_neighbors(self, pos, grid_size_h, grid_size_w):
-        x, y = pos
-        neighbors = []
-        for dx, dy in self.directions:
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < grid_size_h and 0 <= ny < grid_size_w:
-                neighbors.append((nx, ny))
-        return neighbors
-
-    def precompute_costs(self, features):
-        """
-        Efficiently precomputes all edge traversal costs for the entire grid.
-        """
-        H, W, C = features.shape
-        cost_grid = torch.full((H, W, 8), float('inf'), device=features.device)
-        features_norm = F.normalize(features, p=2, dim=-1)
-
-        for i, (dx, dy) in enumerate(self.directions):
-            slice_curr_h = slice(max(0, -dx), min(H, H - dx))
-            slice_curr_w = slice(max(0, -dy), min(W, W - dy))
-            slice_neigh_h = slice(max(0, dx), min(H, H + dx))
-            slice_neigh_w = slice(max(0, dy), min(W, W + dy))
-            
-            curr_feats = features_norm[slice_curr_h, slice_curr_w]
-            neigh_feats = features_norm[slice_neigh_h, slice_neigh_w]
-            
-            similarity = torch.sum(curr_feats * neigh_feats, dim=-1)
-            cost = 1.0 - similarity
-            
-            cost_grid[slice_curr_h, slice_curr_w, i] = cost
-        return cost_grid.cpu().numpy()
-
-    @torch.no_grad()
-    def find_path(self, features, start_node, end_node):
-        """
-        Standard A* search algorithm.
-        """
-        H, W, _ = features.shape
-        heuristic_grid_tensor = self.heuristic_calculator.precompute(features, end_node)
-        heuristic_grid = heuristic_grid_tensor.cpu().numpy()
-        cost_grid = self.precompute_costs(features)
-        
-        open_set = []
-        heapq.heappush(open_set, (heuristic_grid[start_node], start_node))
-        
-        came_from = {}
-        g_score = { (r, c): float('inf') for r in range(H) for c in range(W) }
-        g_score[start_node] = 0
-        
-        while open_set:
-            _, current = heapq.heappop(open_set)
-            
-            if current == end_node:
-                path = []
-                while current in came_from:
-                    path.append(current)
-                    current = came_from[current]
-                path.append(start_node)
-                return path[::-1]
-
-            for neighbor in self.get_neighbors(current, H, W):
-                dx, dy = neighbor[0] - current[0], neighbor[1] - current[1]
-                direction_idx = self.dir_to_idx[(dx, dy)]
-                cost = cost_grid[current[0], current[1], direction_idx]
-                
-                tentative_g_score = g_score[current] + cost
-                
-                if tentative_g_score < g_score.get(neighbor, float('inf')):
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g_score
-                    f_score = tentative_g_score + heuristic_grid[neighbor]
-                    heapq.heappush(open_set, (f_score, neighbor))
-                    
-        return None
-
-# --- 3. Core Architectural Components (Unchanged) ---
+# ---------------------------------------------------------------------------
+# 3. Core Encoder & Decoder (Compatible with official D2Mamba checkpoints)
+# ---------------------------------------------------------------------------
 class ConvAttentionBlock(nn.Module):
-    """A standard block combining convolution with spatial attention."""
-    def __init__(self, dim, heads=8, attention_downsample_size=8):
+    """Standard block combining convolution with spatial attention (JIT-safe functional upsample)."""
+
+    def __init__(self, dim: int, heads: int = 8, attention_downsample_size: int = 8):
         super().__init__()
         self.conv = nn.Conv2d(dim, dim, 3, padding=1, bias=False)
         self.norm = nn.BatchNorm2d(dim)
         self.relu = nn.ReLU(inplace=True)
         self.downsample = nn.AdaptiveAvgPool2d(attention_downsample_size)
         self.attention = nn.MultiheadAttention(dim, heads, batch_first=True)
-        self.upsample = nn.Upsample(scale_factor=None, mode='bilinear', align_corners=False)
+        self.upsample = nn.Upsample(scale_factor=None, mode="bilinear", align_corners=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_conv = self.relu(self.norm(self.conv(x)))
         B, C, H, W = x_conv.shape
         identity = x_conv
@@ -261,29 +266,40 @@ class ConvAttentionBlock(nn.Module):
         x_flat = x_down.flatten(2).transpose(1, 2)
         attn_out, _ = self.attention(x_flat, x_flat, x_flat)
         attn_out = attn_out.transpose(1, 2).reshape(B, C, S, S)
-        self.upsample.size = (H, W)
-        attn_out_up = self.upsample(attn_out)
+        # Functional interpolate avoids mutating self.upsample.size (100% JIT-trace safe!)
+        attn_out_up = F.interpolate(attn_out, size=(H, W), mode="bilinear", align_corners=False)
         return identity + attn_out_up
+
 
 class DualStreamEncoder(nn.Module):
     """
     Encodes the image using two parallel streams: spatial (pixel) and frequency (FFT).
+    Identical state_dict to official D2Mamba; FFT runs in float32 for FP16/AMP safety at 720p.
     """
-    def __init__(self, in_channels=3, base_dim=64):
+
+    def __init__(self, in_channels: int = 3, base_dim: int = 64):
         super().__init__()
         self.spatial_enc1 = nn.Sequential(nn.Conv2d(in_channels, base_dim, 3, padding=1), ConvAttentionBlock(base_dim))
-        self.spatial_enc2 = nn.Sequential(nn.Conv2d(base_dim, base_dim*2, 3, padding=1, stride=2), ConvAttentionBlock(base_dim*2))
+        self.spatial_enc2 = nn.Sequential(
+            nn.Conv2d(base_dim, base_dim * 2, 3, padding=1, stride=2), ConvAttentionBlock(base_dim * 2)
+        )
         self.freq_enc1 = nn.Sequential(nn.Conv2d(2, base_dim, 3, padding=1), nn.ReLU())
-        self.freq_enc2 = nn.Sequential(nn.Conv2d(base_dim, base_dim*2, 3, padding=1, stride=2), nn.ReLU())
-        self.fusion1 = nn.Conv2d(base_dim*2, base_dim, 1)
-        self.fusion2 = nn.Conv2d(base_dim*4, base_dim*2, 1)
-        self.final_conv = nn.Conv2d(base_dim*2, base_dim*4, 3, padding=1, stride=2)
-        self.feature_dim = base_dim*4
+        self.freq_enc2 = nn.Sequential(nn.Conv2d(base_dim, base_dim * 2, 3, padding=1, stride=2), nn.ReLU())
+        self.fusion1 = nn.Conv2d(base_dim * 2, base_dim, 1)
+        self.fusion2 = nn.Conv2d(base_dim * 4, base_dim * 2, 1)
+        self.final_conv = nn.Conv2d(base_dim * 2, base_dim * 4, 3, padding=1, stride=2)
+        self.feature_dim = base_dim * 4
 
-    def forward(self, x):
-        x_fft = torch.fft.fft2(x, norm='ortho')
-        x_fft_mag, x_fft_phase = torch.abs(x_fft), torch.angle(x_fft)
-        x_fft_input = torch.stack([x_fft_mag.mean(1), x_fft_phase.mean(1)], dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Run FFT in FP32 so cuFFT never crashes on non-power-of-two FP16 resolutions like 720x1280
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x_f = x.float()
+            x_fft = torch.fft.fft2(x_f, norm="ortho")
+            x_fft_mag = torch.abs(x_fft)
+            x_fft_phase = torch.angle(x_fft)
+            x_fft_input = torch.stack([x_fft_mag.mean(1), x_fft_phase.mean(1)], dim=1)
+        x_fft_input = x_fft_input.to(x.dtype)
+
         s1 = self.spatial_enc1(x)
         f1 = self.freq_enc1(x_fft_input)
         fused1 = self.fusion1(torch.cat([s1, f1], dim=1))
@@ -293,219 +309,220 @@ class DualStreamEncoder(nn.Module):
         final_features = self.final_conv(fused2)
         return final_features
 
+
 class GatedSynthesisDecoder(nn.Module):
-    """
-    Reconstructs the final image from original and Mamba-corrected features.
-    """
-    def __init__(self, feature_dim=256, base_dim=64):
+    """Reconstructs the final image from original and Mamba-corrected features."""
+
+    def __init__(self, feature_dim: int = 256, base_dim: int = 64):
         super().__init__()
         self.gate = nn.Sequential(nn.Conv2d(feature_dim * 2, feature_dim, 3, padding=1), nn.Sigmoid())
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(feature_dim, base_dim*2, 4, stride=2, padding=1), nn.ReLU(),
-            nn.ConvTranspose2d(base_dim*2, base_dim, 4, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(base_dim, 3, kernel_size=3, padding=1), nn.Sigmoid()
+            nn.ConvTranspose2d(feature_dim, base_dim * 2, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(base_dim * 2, base_dim, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(base_dim, 3, kernel_size=3, padding=1),
+            nn.Sigmoid(),
         )
-    def forward(self, original_features, mamba_corrections):
+
+    def forward(self, original_features: torch.Tensor, mamba_corrections: torch.Tensor) -> torch.Tensor:
         fused_input = torch.cat([original_features, mamba_corrections], dim=1)
         gate_map = self.gate(fused_input)
-        fused_features = (1 - gate_map) * original_features + gate_map * mamba_corrections
+        fused_features = (1.0 - gate_map) * original_features + gate_map * mamba_corrections
         return self.decoder(fused_features)
 
-# --- 4. Pluggable Scan Strategy Modules ---
-class ScanStrategyBase(nn.Module):
-    def __init__(self, **kwargs):
+
+# ---------------------------------------------------------------------------
+# 4. GPU-Native Scan Strategies (MambaIRv2 SGN+ASE Default + Pure-GPU Baselines)
+# ---------------------------------------------------------------------------
+class SemanticGuidedSingleScanStrategy(nn.Module):
+    """
+    100% GPU-native MambaIRv2-inspired Semantic-Guided Single Scan (SGN + ASE):
+      1. Lightweight 2D depthwise pre-conv BEFORE token reordering (preserves local 2D neighborhoods).
+      2. Soft/argmax semantic routing on GPU + torch.argsort token grouping (zero CPU sync).
+      3. Single-direction prompt-augmented ASE Mamba blocks.
+      4. O(L) GPU scatter back to 2D + lightweight 2D depthwise post-refinement.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        mamba_corrector: nn.ModuleList,
+        num_prompts: int = 16,
+    ):
         super().__init__()
-    def forward(self, features, **kwargs):
-        raise NotImplementedError
-
-class AStarScanStrategy(ScanStrategyBase):
-    def __init__(self, pathfinder, saliency_head, mamba_corrector, num_paths, **kwargs):
-        super().__init__()
-        self.pathfinder = pathfinder
-        self.saliency_head = saliency_head
-        self.mamba_corrector = mamba_corrector
-        self.num_paths = num_paths
-
-    def forward(self, features):
-        B, C, H_feat, W_feat = features.shape
-        batch_mamba_corrections = []
-        total_path_len = 0
-        
-        # Data for visualization
-        all_paths_for_batch = []
-        all_saliency_for_batch = []
-
-        for i in range(B):
-            feat_map = features[i].permute(1, 2, 0)
-            
-            saliency_map = self.saliency_head(features[i].unsqueeze(0)).squeeze()
-            flat_saliency = saliency_map.flatten()
-            _, indices = torch.topk(flat_saliency, k=self.num_paths * 2, largest=True)
-            node_coords = [((idx // W_feat).item(), (idx % W_feat).item()) for idx in indices]
-            
-            paths = []
-            for j in range(self.num_paths):
-                start_node, end_node = node_coords[j], node_coords[self.num_paths + j]
-                path = self.pathfinder.find_path(feat_map, start_node, end_node)
-                if path:
-                    paths.append(path)
-            
-            all_paths_for_batch.append(paths)
-            all_saliency_for_batch.append(saliency_map.detach())
-
-            if not paths: paths.append([(0,0), (H_feat-1, W_feat-1)])
-            
-            max_len = max(len(p) for p in paths) if paths else 0
-            if max_len == 0:
-                batch_mamba_corrections.append(torch.zeros_like(features[i]))
-                continue
-
-            path_features = torch.zeros(len(paths), max_len, C, device=features.device)
-            current_path_len = 0
-            for p_idx, path in enumerate(paths):
-                current_path_len += len(path)
-                for step_idx, (r, c) in enumerate(path):
-                    path_features[p_idx, step_idx] = feat_map[r, c]
-            
-            total_path_len += current_path_len
-            
-            mamba_out = self.mamba_corrector(path_features)
-            
-            mamba_correction_map = torch.zeros_like(features[i])
-            counts = torch.zeros(1, H_feat, W_feat, device=features.device)
-            for p_idx, path in enumerate(paths):
-                for step_idx, (r, c) in enumerate(path):
-                    mamba_correction_map[:, r, c] += mamba_out[p_idx, step_idx]
-                    counts[0, r, c] += 1
-            
-            mamba_correction_map /= counts.clamp(min=1)
-            batch_mamba_corrections.append(mamba_correction_map)
-
-        mamba_corrections = torch.stack(batch_mamba_corrections)
-        avg_path_len = total_path_len / B if B > 0 else 0
-        
-        visualizations = {
-            "saliency_maps": torch.stack(all_saliency_for_batch),
-            "paths": all_paths_for_batch
-        }
-        
-        return mamba_corrections, avg_path_len, visualizations
-
-class RasterScanStrategy(ScanStrategyBase):
-    def __init__(self, mamba_corrector, **kwargs):
-        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_prompts = num_prompts
         self.mamba_corrector = mamba_corrector
 
-    def forward(self, features):
+        # 2D depthwise local pre-conv BEFORE token reordering
+        self.pre_dwconv = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1, groups=feature_dim),
+            nn.GELU(),
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=1),
+        )
+
+        # Learnable semantic router predicting K degradation/semantic group scores
+        hidden_r = max(16, feature_dim // 2)
+        self.semantic_router = nn.Sequential(
+            nn.Conv2d(feature_dim, hidden_r, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_r, num_prompts, kernel_size=1),
+        )
+
+        # Lightweight 2D depthwise post-conv smoothing semantic cluster boundaries
+        self.post_dwconv = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1, groups=feature_dim),
+            nn.GELU(),
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=1),
+        )
+
+    def compute_semantic_order(
+        self, feat_2d: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute GPU semantic grouping permutation, inverse permutation, and soft routing probs."""
+        B, C, H, W = feat_2d.shape
+        L = H * W
+        logits = self.semantic_router(feat_2d)  # (B, K, H, W)
+        p_soft = F.softmax(logits.float(), dim=1).to(feat_2d.dtype)  # (B, K, H, W)
+
+        # Group by argmax semantic cluster, ordered smoothly by confidence within each cluster
+        cluster_idx = torch.argmax(p_soft, dim=1)  # (B, H, W)
+        conf = p_soft.max(dim=1).values  # (B, H, W) in [1/K, 1]
+        sort_key = (cluster_idx.float() + (1.0 - conf.float()) * 0.99).reshape(B, L)
+
+        order = torch.argsort(sort_key, dim=1)  # 100% GPU-native, zero CPU sync
+        inv_order = _invert_permutation(order)
+        p_flat = p_soft.flatten(2).transpose(1, 2)  # (B, L, K)
+        return order, inv_order, p_flat
+
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, int, Optional[dict]]:
         B, C, H, W = features.shape
-        path_len = H * W
-        
-        flat_features = features.flatten(2).transpose(1, 2)
-        mamba_out = self.mamba_corrector(flat_features)
-        
-        mamba_corrections = mamba_out.transpose(1, 2).reshape(B, C, H, W)
-        return mamba_corrections, path_len, None
+        L = H * W
 
-class BidirectionalScanStrategy(ScanStrategyBase):
-    def __init__(self, mamba_corrector, **kwargs):
+        # 1. Preserve 2D local neighborhoods BEFORE token reordering
+        local_feat = features + self.pre_dwconv(features)
+
+        # 2. Semantic-Guided Neighboring (SGN) reordering on GPU
+        order, inv_order, p_flat = self.compute_semantic_order(local_feat)
+
+        x_flat = local_feat.flatten(2).transpose(1, 2)  # (B, L, C)
+        x_seq = torch.gather(x_flat, dim=1, index=order.unsqueeze(-1).expand(B, L, C))
+        p_seq = torch.gather(p_flat, dim=1, index=order.unsqueeze(-1).expand(B, L, self.num_prompts))
+
+        # 3. Single-direction prompt-augmented ASE Mamba scan
+        y_seq = x_seq
+        for block in self.mamba_corrector:
+            y_seq = block(y_seq, prompt_weights=p_seq)
+
+        # 4. Inverse permutation back to 2D spatial layout + 2D local refinement
+        y_restored = torch.gather(y_seq, dim=1, index=inv_order.unsqueeze(-1).expand(B, L, C))
+        y_2d = y_restored.transpose(1, 2).reshape(B, C, H, W)
+        y_2d = y_2d + self.post_dwconv(y_2d)
+
+        return y_2d, L, None
+
+
+class RasterScanStrategy(nn.Module):
+    """Fast GPU-native single-direction raster scan ablation using ASEMambaBlock."""
+
+    def __init__(self, mamba_corrector: nn.ModuleList, **kwargs):
         super().__init__()
         self.mamba_corrector = mamba_corrector
 
-    def forward(self, features):
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, int, Optional[dict]]:
         B, C, H, W = features.shape
-        path_len = H * W
-        
-        flat_features = features.flatten(2).transpose(1, 2)
-        
-        # Forward pass
-        mamba_out_fwd = self.mamba_corrector(flat_features)
-        
-        # Backward pass
-        mamba_out_bwd = self.mamba_corrector(torch.flip(flat_features, dims=[1]))
-        mamba_out_bwd = torch.flip(mamba_out_bwd, dims=[1])
-        
-        # Merge and reshape
-        mamba_out = (mamba_out_fwd + mamba_out_bwd) / 2
-        mamba_corrections = mamba_out.transpose(1, 2).reshape(B, C, H, W)
-        return mamba_corrections, path_len, None
+        L = H * W
+        y_seq = features.flatten(2).transpose(1, 2)
+        for block in self.mamba_corrector:
+            y_seq = block(y_seq, prompt_weights=None)
+        return y_seq.transpose(1, 2).reshape(B, C, H, W), L, None
 
-class CrossScanStrategy(ScanStrategyBase):
-    def __init__(self, mamba_corrector, **kwargs):
+
+class BidirectionalScanStrategy(nn.Module):
+    """Fast GPU-native bidirectional raster scan ablation using ASEMambaBlock."""
+
+    def __init__(self, mamba_corrector: nn.ModuleList, **kwargs):
         super().__init__()
         self.mamba_corrector = mamba_corrector
 
-    def forward(self, features):
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, int, Optional[dict]]:
         B, C, H, W = features.shape
-        path_len = H * W
-        
-        flat_features = features.flatten(2).transpose(1, 2)
-        
-        # Top-left to bottom-right
-        out1 = self.mamba_corrector(flat_features)
+        L = H * W
+        flat = features.flatten(2).transpose(1, 2)
+        y_fwd = flat
+        y_bwd = torch.flip(flat, dims=[1])
+        for block in self.mamba_corrector:
+            y_fwd = block(y_fwd, prompt_weights=None)
+            y_bwd = block(y_bwd, prompt_weights=None)
+        y_out = 0.5 * (y_fwd + torch.flip(y_bwd, dims=[1]))
+        return y_out.transpose(1, 2).reshape(B, C, H, W), L, None
 
-        # Bottom-right to top-left
-        out2 = torch.flip(self.mamba_corrector(torch.flip(flat_features, dims=[1])), dims=[1])
-        
-        # Top-right to bottom-left (permute rows then scan)
-        permuted_rows = features.permute(0, 2, 3, 1).reshape(B, H, W, C)
-        permuted_rows = torch.flip(permuted_rows, dims=[1]).reshape(B, H*W, C)
-        out3_permuted = self.mamba_corrector(permuted_rows)
-        out3 = torch.flip(out3_permuted.reshape(B, H, W, C), dims=[1]).reshape(B, H*W, C)
 
-        # Bottom-left to top-right (permute columns then scan)
-        permuted_cols = features.permute(0, 3, 2, 1).reshape(B, W, H, C)
-        permuted_cols = torch.flip(permuted_cols, dims=[1]).reshape(B, W*H, C)
-        out4_permuted = self.mamba_corrector(permuted_cols)
-        out4 = torch.flip(out4_permuted.reshape(B, W, H, C), dims=[1]).permute(0, 2, 1, 3).reshape(B, H*W, C)
-
-        mamba_out = (out1 + out2 + out3 + out4) / 4
-        mamba_corrections = mamba_out.transpose(1, 2).reshape(B, C, H, W)
-        return mamba_corrections, path_len, None
-
+# ---------------------------------------------------------------------------
+# 5. Main D2Mamba Model (Branch 1: MambaIRv2 GPU-Native Semantic-Guided Scan)
+# ---------------------------------------------------------------------------
 class D2Mamba(nn.Module):
     """
-    The main model integrating all components with a pluggable scan strategy.
+    D2Mamba with GPU-native MambaIRv2 Semantic-Guided Single Scan (SGN + ASE).
+    Compatible with official D2Mamba encoder/decoder checkpoints via --init_ckpt.
     """
-    def __init__(self, scan_strategy_name='astar', in_channels=3, base_dim=64, mamba_layers=4, num_paths=8):
+
+    def __init__(
+        self,
+        scan_strategy_name: str = "mambairv2",
+        in_channels: int = 3,
+        base_dim: int = 24,
+        mamba_layers: int = 4,
+        num_paths: int = 4,
+        num_prompts: int = 16,
+        d_state: int = 16,
+        num_heads: int = 4,
+        chunk_size: int = 64,
+    ):
         super().__init__()
         self.scan_strategy_name = scan_strategy_name
 
         self.encoder = DualStreamEncoder(in_channels, base_dim)
         feature_dim = self.encoder.feature_dim
-        
-        self.pathfinder = AStarPathfinder(feature_dim)
-        self.saliency_head = nn.Conv2d(feature_dim, 1, 1)
-        self.mamba_corrector = nn.Sequential(*[MambaBlock(d_model=feature_dim) for _ in range(mamba_layers)])
-        
-        self.decoder = GatedSynthesisDecoder(feature_dim, base_dim)
 
-        strategy_map = {
-            'astar': AStarScanStrategy,
-            'raster': RasterScanStrategy,
-            'bidirectional': BidirectionalScanStrategy,
-            'cross_scan': CrossScanStrategy,
-        }
-        
-        if scan_strategy_name not in strategy_map:
-            raise ValueError(f"Unknown scan strategy: {scan_strategy_name}")
-
-        self.scan_strategy = strategy_map[scan_strategy_name](
-            pathfinder=self.pathfinder,
-            saliency_head=self.saliency_head,
-            mamba_corrector=self.mamba_corrector,
-            num_paths=num_paths
+        self.mamba_corrector = nn.ModuleList(
+            [
+                ASEMambaBlock(
+                    d_model=feature_dim,
+                    d_state=d_state,
+                    expand=2,
+                    num_heads=num_heads,
+                    num_prompts=num_prompts,
+                    chunk_size=chunk_size,
+                )
+                for _ in range(mamba_layers)
+            ]
         )
 
-    def forward(self, x):
+        self.decoder = GatedSynthesisDecoder(feature_dim, base_dim)
+
+        if scan_strategy_name == "mambairv2":
+            self.scan_strategy = SemanticGuidedSingleScanStrategy(
+                feature_dim=feature_dim,
+                mamba_corrector=self.mamba_corrector,
+                num_prompts=num_prompts,
+            )
+        elif scan_strategy_name == "raster":
+            self.scan_strategy = RasterScanStrategy(mamba_corrector=self.mamba_corrector)
+        elif scan_strategy_name == "bidirectional":
+            self.scan_strategy = BidirectionalScanStrategy(mamba_corrector=self.mamba_corrector)
+        else:
+            raise ValueError(
+                f"Unknown scan strategy '{scan_strategy_name}'. "
+                f"Supported on exp/1-mambairv2-gpu-scan: ['mambairv2', 'raster', 'bidirectional']"
+            )
+
+    def forward(self, x: torch.Tensor):
         features = self.encoder(x)
-        
         mamba_corrections, path_len, visualizations = self.scan_strategy(features)
-        
         output_image = self.decoder(features, mamba_corrections)
 
         if self.training:
             return output_image, path_len
-        else: # self.eval()
-            return output_image, path_len, visualizations
-
-
+        return output_image, path_len, visualizations

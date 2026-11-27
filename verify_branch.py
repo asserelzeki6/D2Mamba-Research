@@ -223,8 +223,73 @@ def check_init_ckpt_compat(scan_mode: str, device: torch.device, base_dim: int, 
 
 
 def check_branch_invariants(model: nn.Module, device: torch.device) -> None:
-    """Extended by each feature branch to test mathematical invariants."""
-    print("[CHECK (e)] Base harness invariants: PASS")
+    """Branch 1 invariants: exact chunked SSD scan, SGN bijection, ASE prompt grads, dynamic JIT."""
+    from model import SemanticGuidedSingleScanStrategy, chunked_ssd_scan
+
+    print("[CHECK (e)] Branch 1 (MambaIRv2 GPU Scan) mathematical invariants:")
+
+    # 1. Exact equivalence of chunked_ssd_scan vs sequential recurrence on non-chunk-multiple L=135
+    torch.manual_seed(0)
+    B, L, H, P, N = 2, 135, 4, 8, 16
+    x = torch.randn(B, L, H, P, device=device)
+    dt = torch.rand(B, L, H, device=device) * 0.2 + 0.01
+    A = -torch.linspace(0.5, 4.0, H, device=device)
+    Bp = torch.randn(B, L, H, N, device=device) * 0.2
+    Cp = torch.randn(B, L, H, N, device=device) * 0.2
+
+    y_ssd = chunked_ssd_scan(x, dt, A, Bp, Cp, chunk_size=32)
+    # Brute-force reference recurrence
+    h = torch.zeros(B, H, P, N, device=device)
+    ys = []
+    for t in range(L):
+        a_t = torch.exp(dt[:, t, :] * A.view(1, H))  # (B, H)
+        b_t = dt[:, t, :].unsqueeze(-1) * Bp[:, t]    # (B, H, N)
+        h = a_t.unsqueeze(-1).unsqueeze(-1) * h + x[:, t].unsqueeze(-1) * b_t.unsqueeze(-2)
+        y_t = (h * Cp[:, t].unsqueeze(-2)).sum(dim=-1)
+        ys.append(y_t)
+    y_ref = torch.stack(ys, dim=1)
+    ssd_err = (y_ssd - y_ref).abs().max().item()
+    assert ssd_err < 1e-4, f"chunked_ssd_scan mismatch vs sequential recurrence: {ssd_err:.3e}"
+    print(f"            - Exact chunked_ssd_scan vs sequential recurrence (L={L}): max_err={ssd_err:.3e} -> PASS")
+
+    # 2. SGN permutation bijection & pre_dwconv presence
+    assert isinstance(model.scan_strategy, SemanticGuidedSingleScanStrategy), "Expected SemanticGuidedSingleScanStrategy"
+    assert hasattr(model.scan_strategy, "pre_dwconv"), "Missing 2D depthwise pre_dwconv before token reordering"
+    feat = torch.randn(2, model.encoder.feature_dim, 16, 16, device=device)
+    order, inv_order, p_flat = model.scan_strategy.compute_semantic_order(feat)
+    x_flat = feat.flatten(2).transpose(1, 2)
+    C = x_flat.shape[-1]
+    L_f = x_flat.shape[1]
+    x_perm = torch.gather(x_flat, 1, order.unsqueeze(-1).expand(2, L_f, C))
+    x_back = torch.gather(x_perm, 1, inv_order.unsqueeze(-1).expand(2, L_f, C))
+    bij_err = (x_flat - x_back).abs().max().item()
+    assert bij_err == 0.0, f"SGN permutation is not an exact bijection: {bij_err}"
+    assert torch.allclose(p_flat.sum(dim=-1), torch.ones(2, L_f, device=device), atol=1e-5)
+    print(f"            - SGN GPU permutation bijection & softmax probs: max_err={bij_err:.1e} -> PASS")
+
+    # 3. Verify ASE prompt_pool & semantic_router receive non-zero gradients
+    model.train()
+    model.zero_grad(set_to_none=True)
+    inp = torch.rand(1, 3, 128, 128, device=device)
+    pred, _ = forward_model(model, inp)
+    pred.mean().backward()
+    router_grad = sum(p.grad.abs().sum().item() for p in model.scan_strategy.semantic_router.parameters() if p.grad is not None)
+    prompt_grad = sum(b.prompt_pool.grad.abs().sum().item() for b in model.mamba_corrector if b.prompt_pool.grad is not None)
+    assert router_grad > 0.0, "semantic_router received zero gradient!"
+    assert prompt_grad > 0.0, "ASE prompt_pool received zero gradient!"
+    print(f"            - End-to-end ASE gradients (router={router_grad:.2e}, prompt_pool={prompt_grad:.2e}) -> PASS")
+
+    # 4. Verify traced JIT model works dynamically at smaller (128x128) & larger (320x320) resolutions
+    model.eval()
+    wrapper = TraceWrapper(model).eval()
+    with torch.no_grad():
+        traced = torch.jit.trace(wrapper, torch.rand(1, 3, 256, 256, device=device), check_trace=True)
+        x_128 = torch.rand(1, 3, 128, 128, device=device)
+        x_320 = torch.rand(1, 3, 320, 320, device=device)
+        diff_128 = (wrapper(x_128) - traced(x_128)).abs().max().item()
+        diff_320 = (wrapper(x_320) - traced(x_320)).abs().max().item()
+    assert diff_128 < 1e-4 and diff_320 < 1e-4, f"Dynamic-shape JIT trace mismatch: 128={diff_128:.3e}, 320={diff_320:.3e}"
+    print(f"            - Dynamic-shape JIT trace (traced@256, eval@128={diff_128:.2e}, eval@320={diff_320:.2e}) -> PASS")
 
 
 def main() -> None:
