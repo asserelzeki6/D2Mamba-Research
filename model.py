@@ -1,15 +1,21 @@
 """
-D2Mamba Research — Branch 3: exp/3-haar-phase-fast
-Maximum Edge Speed (>45-50 FPS on T4) + Frequency & Physics Theory:
-  - Outer high-resolution stages replaced by Structurally Reparameterizable Depthwise Convolutions
-    (RepConv: parallel 7x7 + 3x3 + 1x1 branches with exact .fuse() verified < 1e-5) + 1-level Haar
-    DWT High-Frequency Gating (100% FP16-safe on arbitrary even resolutions, zero cuFFT).
-  - Physics-guided single-scan Mamba (Micro-AT + near-to-far telescoping Beer-Lambert dt scan)
-    strictly in the low-resolution compressed bottleneck (H/8 x W/8).
-  - Lightweight Green/Blue-Phase-Guided Red Channel Refinement block using high-frequency
-    Haar/directional-phase cues from the intact G & B channels to sharpen & stabilize R.
-  - 100% GPU-native pure PyTorch, zero CPU heapq / .cpu() / .numpy(), < 2.2M params,
-    torch.jit.trace verified both unfused and fused.
+D2Mamba Research — Branch 4: exp/4-phaseformer-physics-mamba
+Hybrid Phaseformer-Inspired Frequency Cross-Gating + Multi-Scale Haar U-Net + Physics-Guided Mamba:
+  - Explicit 2D Fourier Phase-Amplitude Cross-Gating (FourierPhaseAmplitudeGate) inspired by
+    Phaseformer (WACV'25), running strictly in FP32 under --amp (zero FP16 cuFFT crashes on
+    arbitrary resolutions) with branch-cut-free unit phasors (cos, sin) and dynamic-shape
+    torch.jit.trace(..., check_trace=True) safety.
+  - Multi-scale U-Net / Haar skip connections:
+      * Stage 1 (H/2): 1-level Haar DWT HF Gating + RepConv + Optimized Phase Attention Skip.
+      * Stage 2 (H/4): RepConv + HaarHFGate + 2D Fourier Phase-Amplitude Cross-Gating.
+      * Bottleneck (H/8): Compressed Physics-Guided Single-Scan Mamba (Micro-AT + near-to-far
+        telescoping Beer-Lambert dt scan) + Bottleneck 2D Fourier Phase-Amplitude Cross-Gating.
+      * Decoder (H/4 -> H/2 -> Haar IDWT -> H): Phase-gated multi-scale skips + RepConv +
+        decoder HaarHFGate + lossless residual Haar synthesis + GBPhaseRedRefiner.
+  - Structurally Reparameterizable Depthwise Convolutions (RepConv: 7x7 + 3x3 + 1x1) with exact
+    .fuse() verified < 1e-5.
+  - 100% GPU-native pure PyTorch, zero CPU heapq / .cpu() / .numpy(), < 1.1M params (< 2.2M cap),
+    torch.jit.trace verified both unfused and fused across dynamic shapes.
 """
 
 import math
@@ -186,6 +192,126 @@ def haar_idwt_2d(
     elif out_h > 0 and out_w > 0:
         out = out[:, :, :out_h, :out_w]
     return out
+
+
+@torch.jit.script
+def _rfft2_decompose_fp32(
+    x_f: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Strict FP32 2D real FFT decomposition into smooth amplitude & branch-cut-free unit phasors.
+    Uses smooth sqrt(re^2 + im^2 + 1e-8) so zero/constant inputs have 100% finite gradients.
+    """
+    z = torch.fft.rfft2(x_f, norm="ortho")
+    re = z.real
+    im = z.imag
+    amp = torch.sqrt(re * re + im * im + 1e-8)
+    cos_p = re / amp
+    sin_p = im / amp
+    log_amp = torch.log1p(amp)
+    return amp, log_amp, cos_p, sin_p
+
+
+@torch.jit.script
+def _irfft2_reconstruct_fp32(
+    amp: torch.Tensor,
+    cos_p: torch.Tensor,
+    sin_p: torch.Tensor,
+    ref: torch.Tensor,
+) -> torch.Tensor:
+    """Strict FP32 dynamic-shape 2D inverse real FFT (preserves symbolic H, W in JIT traces)."""
+    z = torch.complex(amp * cos_p, amp * sin_p)
+    return torch.fft.irfft2(z, s=[ref.shape[2], ref.shape[3]], norm="ortho")
+
+
+class FourierPhaseAmplitudeGate(nn.Module):
+    """
+    Phaseformer-inspired (WACV'25) Explicit 2D Fourier Phase-Amplitude Cross-Gating Block:
+      - Runs strictly in FP32 inside autocast(enabled=False) so cuFFT never crashes in FP16
+        on arbitrary/non-power-of-two resolutions (e.g., 198x314, 720x1280, odd sizes).
+      - Uses branch-cut-free unit phasors (cos, sin) = (Re/|Z|, Im/|Z|) instead of atan2.
+      - Phase-to-Amplitude Cross-Gate: uncontaminated structural phase guides multiplicative
+        Beer-Lambert-like log-amplitude restoration exp(clamp(s_a * d_amp, -1.5, 1.5)).
+      - Amplitude-to-Phase Cross-Gate: spectral energy log1p(amp) gates phase refinement
+        before smooth unit-circle re-normalization.
+      - Dynamic-shape torch.jit.trace(..., check_trace=True) safe via TorchScript FFT helpers.
+    """
+
+    def __init__(self, dim: int, hidden_dim: Optional[int] = None):
+        super().__init__()
+        h = hidden_dim if hidden_dim is not None else max(16, (dim * 3) // 4)
+        self.dim = dim
+        self.hidden_dim = h
+
+        # Phase encoder on [cos_p, sin_p] (2C -> h)
+        self.phase_enc = nn.Sequential(
+            nn.Conv2d(dim * 2, h, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(h, h, kernel_size=3, padding=1, groups=h),
+            nn.GELU(),
+        )
+        # Amplitude encoder on log1p(amp) (C -> h)
+        self.amp_enc = nn.Sequential(
+            nn.Conv2d(dim, h, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(h, h, kernel_size=3, padding=1, groups=h),
+            nn.GELU(),
+        )
+
+        # Phase -> Amplitude cross-gate & bounded log-amplitude delta
+        self.p2a_gate = nn.Sequential(nn.Conv2d(h, h, kernel_size=1), nn.Sigmoid())
+        self.amp_delta = nn.Conv2d(h, dim, kernel_size=1)
+
+        # Amplitude -> Phase cross-gate & unit-phasor residual (d_cos, d_sin)
+        self.a2p_gate = nn.Sequential(nn.Conv2d(h, h, kernel_size=1), nn.Sigmoid())
+        self.phase_delta = nn.Conv2d(h, dim * 2, kernel_size=1)
+
+        # Spatial output projection after inverse FFT
+        self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
+
+        self.amp_scale = nn.Parameter(torch.tensor(0.25))
+        self.phase_scale = nn.Parameter(torch.tensor(0.15))
+        self.res_scale = nn.Parameter(torch.tensor(0.25))
+
+        with torch.no_grad():
+            self.amp_delta.weight.mul_(0.1)
+            self.amp_delta.bias.zero_()
+            self.phase_delta.weight.mul_(0.1)
+            self.phase_delta.bias.zero_()
+            self.out_proj.weight.mul_(0.1)
+            self.out_proj.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x_f = x.float()
+            amp, log_amp, cos_p, sin_p = _rfft2_decompose_fp32(x_f)
+
+            phase_in = torch.cat([cos_p, sin_p], dim=1)
+            phase_ctx = self.phase_enc(phase_in)
+            amp_ctx = self.amp_enc(log_amp)
+
+            # 1. Phase-to-Amplitude Cross-Gating (strictly positive bounded multiplicative gain)
+            g_p2a = self.p2a_gate(phase_ctx)
+            d_amp = torch.tanh(self.amp_delta(amp_ctx * g_p2a))
+            amp_gain = torch.exp(torch.clamp(self.amp_scale.float() * d_amp, min=-1.5, max=1.5))
+            amp_out = amp * amp_gain
+
+            # 2. Amplitude-to-Phase Cross-Gating (unit-circle re-normalized phasor update)
+            g_a2p = self.a2p_gate(amp_ctx)
+            d_ri = torch.tanh(self.phase_delta(phase_ctx * g_a2p))
+            d_cos, d_sin = d_ri.chunk(2, dim=1)
+            s_p = self.phase_scale.float()
+            p_re = cos_p + s_p * d_cos
+            p_im = sin_p + s_p * d_sin
+            p_norm = torch.sqrt(p_re * p_re + p_im * p_im + 1e-8)
+            cos_out = p_re / p_norm
+            sin_out = p_im / p_norm
+
+            # 3. Dynamic-shape inverse 2D real FFT + residual projection
+            x_rec = _irfft2_reconstruct_fp32(amp_out, cos_out, sin_out, x_f)
+            delta = self.out_proj(x_rec) * self.res_scale.float()
+
+        return x + delta.to(orig_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -586,22 +712,25 @@ class PhysicsAttenuationScanStrategy(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 5. Main D2Mamba Model (Branch 3: Haar-Phase Fast Edge Architecture)
+# 5. Main D2Mamba Model (Branch 4: Phaseformer + Haar U-Net + Physics Mamba)
 # ---------------------------------------------------------------------------
 class D2Mamba(nn.Module):
     """
-    Branch 3: Haar-Phase-Fast Underwater Restoration Network:
-      - Stage 1 (H/2): 1-level Haar DWT High-Frequency Gating + RepConvBlock
-      - Stage 2 (H/4): RepConvBlock + HaarHFGate
+    Branch 4: Phaseformer-Inspired Frequency + Multi-Scale Haar U-Net + Physics-Guided Mamba:
+      - Stage 1 (H/2): 1-level Haar DWT HF Gating + RepConv + Fourier Phase-Amplitude Skip
+      - Stage 2 (H/4): RepConv + HaarHFGate + 2D Fourier Phase-Amplitude Cross-Gating
       - Bottleneck (H/8): Physics-Guided Single-Scan Mamba (Micro-AT + Telescoping Beer-Lambert ASE)
-      - Decoder (H/4 -> H/2 -> Haar IDWT -> H): Fast RepConv skips + residual Haar synthesis
+                          + Bottleneck 2D Fourier Phase-Amplitude Cross-Gating
+      - Decoder (H/4 -> H/2 -> Haar IDWT -> H): Phase-gated multi-scale skips + RepConv +
+                                                HaarHFGate + residual Haar synthesis
       - Post-Head: Green/Blue-Phase-Guided Red Channel Refinement (GBPhaseRedRefiner)
-      - Zero torch.fft / cuFFT, 100% FP16-safe on arbitrary even resolutions, .fuse() ready.
+      - Strictly FP32 inside 2D FFT & physics heads (100% AMP-safe on arbitrary resolutions),
+        RepConv .fuse() ready (< 1e-5), dynamic-shape torch.jit.trace verified.
     """
 
     def __init__(
         self,
-        scan_strategy_name: str = "haar_phase_fast",
+        scan_strategy_name: str = "phaseformer_physics_mamba",
         in_channels: int = 3,
         base_dim: int = 24,
         mamba_layers: int = 4,
@@ -619,18 +748,20 @@ class D2Mamba(nn.Module):
         c2 = c1 * 2                         # 64
         c_bot = c2 * 2                      # 128
 
-        # Stage 1 (H/2 x W/2): 1-level Haar DWT High-Frequency Gating + RepConv
+        # Stage 1 (H/2 x W/2): 1-level Haar DWT High-Frequency Gating + RepConv + Phase Skip
         self.ll_stem = nn.Sequential(nn.Conv2d(in_channels, c1, kernel_size=3, padding=1), nn.GELU())
         self.hf_stem = nn.Sequential(nn.Conv2d(in_channels * 3, c1, kernel_size=1), RepConv(c1), nn.GELU())
         self.hf_gate_proj = nn.Sequential(nn.Conv2d(c1, c1, kernel_size=1), nn.Sigmoid())
         self.enc_stage1 = RepConvBlock(c1, expand=2)
+        self.phase_skip1 = FourierPhaseAmplitudeGate(c1, hidden_dim=max(16, (c1 * 3) // 4))
 
-        # Stage 2 (H/4 x W/4): Stride-2 downsample + RepConv + Haar HF Gating
+        # Stage 2 (H/4 x W/4): Stride-2 downsample + RepConv + Haar HF Gate + Fourier Phase Gate
         self.down1 = nn.Sequential(nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1), nn.GELU())
         self.enc_stage2 = RepConvBlock(c2, expand=2)
         self.haar_gate2 = HaarHFGate(c2)
+        self.phase_gate2 = FourierPhaseAmplitudeGate(c2, hidden_dim=max(24, (c2 * 3) // 4))
 
-        # Bottleneck (H/8 x W/8): Compressed physics-guided Mamba bottleneck ONLY
+        # Bottleneck (H/8 x W/8): Compressed physics-guided Mamba + global Fourier Phase Gate
         self.down2 = nn.Sequential(nn.Conv2d(c2, c_bot, kernel_size=3, stride=2, padding=1), nn.GELU())
         self.physics_head = MicroATHead(feature_dim=c_bot, hidden_dim=32, beta_max=4.0)
         self.mamba_corrector = nn.ModuleList(
@@ -653,13 +784,15 @@ class D2Mamba(nn.Module):
             num_prompts=num_prompts,
         )
         self.bot_gate = nn.Sequential(nn.Conv2d(c_bot * 2, c_bot, kernel_size=1), nn.Sigmoid())
+        self.phase_bot = FourierPhaseAmplitudeGate(c_bot, hidden_dim=max(32, c_bot // 2))
 
-        # Fast RepConv Decoder with bilinear upsampling + skip fusion (zero ConvTranspose2d)
+        # Fast RepConv Decoder with bilinear upsampling + Phase-Gated multi-scale skips
         self.dec_fuse2 = nn.Conv2d(c_bot + c2, c2, kernel_size=1)
         self.dec_stage2 = RepConvBlock(c2, expand=2)
 
         self.dec_fuse1 = nn.Conv2d(c2 + c1, c1, kernel_size=1)
         self.dec_stage1 = RepConvBlock(c1, expand=2)
+        self.dec_haar1 = HaarHFGate(c1)
 
         # Predict residual Haar subbands (LL, LH, HL, HH) -> HaarIDWT2d
         self.subband_head = nn.Conv2d(c1, in_channels * 4, kernel_size=3, padding=1)
@@ -685,22 +818,24 @@ class D2Mamba(nn.Module):
         ll_feat = self.ll_stem(ll_in)
         hf_feat = self.hf_stem(hf_in)
         s1 = self.enc_stage1(ll_feat + self.hf_gate_proj(hf_feat) * hf_feat)
+        s1_skip = self.phase_skip1(s1)
 
-        # 2. Outer Stage 2 (H/4): RepConv + Haar High-Frequency Gating
-        s2 = self.haar_gate2(self.enc_stage2(self.down1(s1)))
+        # 2. Outer Stage 2 (H/4): RepConv + Haar HF Gating + 2D Fourier Phase-Amplitude Gate
+        s2 = self.phase_gate2(self.haar_gate2(self.enc_stage2(self.down1(s1))))
 
-        # 3. Compressed Bottleneck (H/8): Physics-Guided Single-Scan Mamba ONLY
+        # 3. Compressed Bottleneck (H/8): Physics-Guided Single-Scan Mamba + Bottleneck Fourier Phase Gate
         bot = self.down2(s2)
         mamba_corr, path_len, physics = self.scan_strategy(bot, x_rgb=x)
         g_bot = self.bot_gate(torch.cat([bot, mamba_corr], dim=1))
-        bot_fused = (1.0 - g_bot) * bot + g_bot * mamba_corr
+        bot_mamba = (1.0 - g_bot) * bot + g_bot * mamba_corr
+        bot_fused = self.phase_bot(bot_mamba)
 
-        # 4. Fast RepConv Decoder -> Residual Haar IDWT Synthesis
+        # 4. Fast RepConv Decoder with Phase-Gated Multi-Scale Skips -> Residual Haar IDWT Synthesis
         u2 = F.interpolate(bot_fused, size=s2.shape[-2:], mode="bilinear", align_corners=False)
         d2 = self.dec_stage2(self.dec_fuse2(torch.cat([u2, s2], dim=1)))
 
-        u1 = F.interpolate(d2, size=s1.shape[-2:], mode="bilinear", align_corners=False)
-        d1 = self.dec_stage1(self.dec_fuse1(torch.cat([u1, s1], dim=1)))
+        u1 = F.interpolate(d2, size=s1_skip.shape[-2:], mode="bilinear", align_corners=False)
+        d1 = self.dec_haar1(self.dec_stage1(self.dec_fuse1(torch.cat([u1, s1_skip], dim=1))))
 
         d_ll, d_lh, d_hl, d_hh = self.subband_head(d1).chunk(4, dim=1)
         img_pre = haar_idwt_2d(
