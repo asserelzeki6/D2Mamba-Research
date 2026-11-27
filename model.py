@@ -265,10 +265,32 @@ class RepConv(nn.Module):
         self.fused = True
         return self
 
+    @staticmethod
+    def _run_branch(x: torch.Tensor, branch: nn.Sequential) -> torch.Tensor:
+        conv = branch[0]
+        bn = branch[1]
+        y = conv(x)
+        if bn.training:
+            return bn(y)
+        # Explicit centered (1, C, 1, 1) FP32 BN avoids PyTorch TorchScript CUDA TensorExpr
+        # aten::batch_norm fusion bug (which mis-broadcasts 1D C params against dim 3 W
+        # when fused with downstream multi-branch ops such as Haar IDWT) while avoiding
+        # catastrophic cancellation when y is close to running_mean.
+        inv_std = torch.rsqrt(bn.running_var.float() + bn.eps)
+        scale = (bn.weight.float() * inv_std).view(1, -1, 1, 1)
+        mean = bn.running_mean.float().view(1, -1, 1, 1)
+        bias = bn.bias.float().view(1, -1, 1, 1)
+        out = (y.float() - mean) * scale + bias
+        return out.to(y.dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fused and self.fused_conv is not None:
             return self.fused_conv(x)
-        return self.branch7(x) + self.branch3(x) + self.branch1(x)
+        return (
+            self._run_branch(x, self.branch7)
+            + self._run_branch(x, self.branch3)
+            + self._run_branch(x, self.branch1)
+        )
 
 
 class RepConvBlock(nn.Module):
@@ -412,12 +434,13 @@ class MicroATHead(nn.Module):
         H_f, W_f = features.shape[-2:]
         x_low = F.interpolate(x_rgb, size=(H_f, W_f), mode="bilinear", align_corners=False)
         h = self.fuse(torch.cat([self.feat_proj(features), self.rgb_stem(x_low)], dim=1))
-        # Strict FP32 for physics outputs (safe under --amp; cast h to float32 before FP32 head convs)
+        # Strict FP32 for physics outputs (safe under --amp and pure .half()/.bfloat16() models)
+        w_dtype = self.depth_head.weight.dtype
         with torch.amp.autocast(device_type=x_rgb.device.type, enabled=False):
-            h_f = h.float()
-            d_hat = torch.sigmoid(self.depth_head(h_f))
-            beta_D = self._smooth_bound_beta(self.beta_D_head(h_f))
-            beta_B = self._smooth_bound_beta(self.beta_B_head(h_f))
+            h_w = h.to(w_dtype)
+            d_hat = torch.sigmoid(self.depth_head(h_w).float())
+            beta_D = self._smooth_bound_beta(self.beta_D_head(h_w).float())
+            beta_B = self._smooth_bound_beta(self.beta_B_head(h_w).float())
             B_inf = _anchor_veiling_light(x_low.float(), d_hat)
         return d_hat, beta_D, beta_B, B_inf
 
