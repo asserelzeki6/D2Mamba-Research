@@ -48,7 +48,7 @@ OFFICIAL_SPLIT_URLS = {
     "lsui": "https://raw.githubusercontent.com/ddz16/UIE_Benckmark/main/data/LSUI/test.txt",
 }
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-DEFAULT_SCAN_MODE = "mambairv2"
+DEFAULT_SCAN_MODE = "physics_attenuation"
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +142,63 @@ def compute_batch_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str,
         "ssim_rgb": ssim_rgb,
         "psnr_y": psnr_y,
         "ssim_y": ssim_y,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Training-Only Pseudo-Linearized Akkaynak-Treibitz Cycle Consistency Loss
+# ---------------------------------------------------------------------------
+def compute_physics_cycle_loss(
+    J_hat: torch.Tensor,
+    I_raw: torch.Tensor,
+    physics: Dict[str, torch.Tensor],
+    lambda_phys: float = 0.1,
+    lambda_noncollapse: float = 0.01,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Training-only Pseudo-Linearized Akkaynak-Treibitz Cycle Consistency Loss (strict FP32):
+      1. J_lin = (J_hat + 1e-4)^2.2,  B_inf_lin = (B_inf + 1e-4)^2.2
+      2. I_lin = J_lin * exp(-beta_D * d_hat) + B_inf_lin * (1 - exp(-beta_B * d_hat))
+      3. I_hat = (I_lin + 1e-4)^(1 / 2.2)
+      4. L_phys = lambda_phys * (L1(I_hat, I_raw) + 0.1 * (1 - SSIM(I_hat, I_raw)))
+                + lambda_noncollapse * exp(-5 * mean(|beta_D - beta_B|))
+    """
+    # Force FP32 for all powers, exponentials, and SSIM even under --amp
+    J_f = J_hat.float().clamp(0.0, 1.0)
+    I_f = I_raw.float().clamp(0.0, 1.0)
+    d_hat = physics["d_hat"].float().clamp(0.0, 1.0)
+    beta_D = physics["beta_D"].float().clamp(min=1e-4)
+    beta_B = physics["beta_B"].float().clamp(min=1e-4)
+    B_inf = physics["B_inf"].float().clamp(0.0, 1.0)
+
+    H, W = I_f.shape[-2:]
+    if d_hat.shape[-2:] != (H, W):
+        d_hat = F.interpolate(d_hat, size=(H, W), mode="bilinear", align_corners=False)
+        beta_D = F.interpolate(beta_D, size=(H, W), mode="bilinear", align_corners=False)
+        beta_B = F.interpolate(beta_B, size=(H, W), mode="bilinear", align_corners=False)
+
+    J_lin = (J_f + 1e-4).pow(2.2)
+    B_inf_lin = (B_inf + 1e-4).pow(2.2)
+
+    T_D = torch.exp(-beta_D * d_hat)
+    T_B = torch.exp(-beta_B * d_hat)
+    I_lin = J_lin * T_D + B_inf_lin * (1.0 - T_B)
+
+    I_hat = (I_lin.clamp(min=0.0) + 1e-4).pow(1.0 / 2.2)
+
+    cycle_l1 = F.l1_loss(I_hat, I_f)
+    cycle_ssim = 1.0 - compute_ssim_torch(I_hat.clamp(0.0, 1.0), I_f)
+    loss_cycle = cycle_l1 + 0.1 * cycle_ssim
+
+    # Smooth non-collapse regularizer preventing beta_D == beta_B
+    beta_sep = (beta_D - beta_B).abs().mean()
+    loss_noncollapse = torch.exp(-5.0 * beta_sep)
+
+    total_phys = lambda_phys * loss_cycle + lambda_noncollapse * loss_noncollapse
+    return total_phys, {
+        "phys_cycle": float(loss_cycle.detach().item()),
+        "phys_noncollapse": float(loss_noncollapse.detach().item()),
+        "beta_sep": float(beta_sep.detach().item()),
     }
 
 
@@ -505,7 +562,10 @@ def build_model(args: argparse.Namespace) -> nn.Module:
 
 def forward_model(model: nn.Module, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[dict]]:
     """Run model forward and normalize output to (restored_img, aux_dict_or_None)."""
-    out = model(x)
+    if model.training and getattr(model, "supports_return_aux", False):
+        out = model(x, return_aux=True)
+    else:
+        out = model(x)
     aux = None
     if isinstance(out, tuple):
         pred = out[0]
@@ -515,8 +575,6 @@ def forward_model(model: nn.Module, x: torch.Tensor) -> Tuple[torch.Tensor, Opti
                 break
     else:
         pred = out
-    if aux is None and hasattr(model, "last_physics") and model.last_physics is not None:
-        aux = {"physics": model.last_physics}
     return pred, aux
 
 
@@ -694,6 +752,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--lambda_ssim", type=float, default=0.2)
     parser.add_argument("--lambda_percep", type=float, default=0.02)
+    parser.add_argument("--lambda_phys", type=float, default=0.1, help="Weight for Akkaynak-Treibitz cycle consistency loss")
+    parser.add_argument("--lambda_noncollapse", type=float, default=0.01, help="Non-collapse weight preventing beta_D == beta_B")
     parser.add_argument("--no_vgg", action="store_true", help="Disable VGG16 perceptual loss")
     return parser.parse_args()
 
@@ -789,6 +849,16 @@ def main() -> None:
                 loss_ssim = 1.0 - compute_ssim_torch(pred_f, clean_f)
                 loss_percep = percep_loss_fn(pred_f, clean_f)
                 loss = loss_l1 + args.lambda_ssim * loss_ssim + args.lambda_percep * loss_percep
+
+                if aux is not None and isinstance(aux, dict) and "physics" in aux and args.lambda_phys > 0:
+                    loss_phys, _ = compute_physics_cycle_loss(
+                        J_hat=pred_f,
+                        I_raw=hazy.float(),
+                        physics=aux["physics"],
+                        lambda_phys=args.lambda_phys,
+                        lambda_noncollapse=args.lambda_noncollapse,
+                    )
+                    loss = loss + loss_phys
 
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss detected at epoch {epoch}, step {global_step}: {loss.item()}")

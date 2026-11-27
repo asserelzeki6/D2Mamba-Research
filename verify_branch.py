@@ -223,63 +223,101 @@ def check_init_ckpt_compat(scan_mode: str, device: torch.device, base_dim: int, 
 
 
 def check_branch_invariants(model: nn.Module, device: torch.device) -> None:
-    """Branch 1 invariants: exact chunked SSD scan, SGN bijection, ASE prompt grads, dynamic JIT."""
-    from model import SemanticGuidedSingleScanStrategy, chunked_ssd_scan
+    """Branch 2 invariants: Micro-AT <0.15M, decoupled beta_D/beta_B, top-5% B_inf,
+    telescoping Beer-Lambert invariance, Akkaynak-Treibitz cycle loss, and dynamic JIT."""
+    from model import (
+        MicroATHead,
+        PhysicsAttenuationScanStrategy,
+        _anchor_veiling_light,
+    )
+    from train_kaggle import compute_physics_cycle_loss
 
-    print("[CHECK (e)] Branch 1 (MambaIRv2 GPU Scan) mathematical invariants:")
+    print("[CHECK (e)] Branch 2 (Physics-Anchored Attenuation Scan) mathematical invariants:")
 
-    # 1. Exact equivalence of chunked_ssd_scan vs sequential recurrence on non-chunk-multiple L=135
-    torch.manual_seed(0)
-    B, L, H, P, N = 2, 135, 4, 8, 16
-    x = torch.randn(B, L, H, P, device=device)
-    dt = torch.rand(B, L, H, device=device) * 0.2 + 0.01
-    A = -torch.linspace(0.5, 4.0, H, device=device)
-    Bp = torch.randn(B, L, H, N, device=device) * 0.2
-    Cp = torch.randn(B, L, H, N, device=device) * 0.2
+    # 1. Micro-AT parameter count strictly < 0.15M
+    assert isinstance(model.physics_head, MicroATHead), "Expected MicroATHead on Branch 2"
+    micro_at_params = sum(p.numel() for p in model.physics_head.parameters())
+    assert micro_at_params < 150_000, f"Micro-AT params ({micro_at_params:,}) exceeds 0.15M!"
+    print(f"            - Micro-AT params: {micro_at_params:,} ({micro_at_params/1e6:.4f}M < 0.15M) -> PASS")
 
-    y_ssd = chunked_ssd_scan(x, dt, A, Bp, Cp, chunk_size=32)
-    # Brute-force reference recurrence
-    h = torch.zeros(B, H, P, N, device=device)
-    ys = []
-    for t in range(L):
-        a_t = torch.exp(dt[:, t, :] * A.view(1, H))  # (B, H)
-        b_t = dt[:, t, :].unsqueeze(-1) * Bp[:, t]    # (B, H, N)
-        h = a_t.unsqueeze(-1).unsqueeze(-1) * h + x[:, t].unsqueeze(-1) * b_t.unsqueeze(-2)
-        y_t = (h * Cp[:, t].unsqueeze(-2)).sum(dim=-1)
-        ys.append(y_t)
-    y_ref = torch.stack(ys, dim=1)
-    ssd_err = (y_ssd - y_ref).abs().max().item()
-    assert ssd_err < 1e-4, f"chunked_ssd_scan mismatch vs sequential recurrence: {ssd_err:.3e}"
-    print(f"            - Exact chunked_ssd_scan vs sequential recurrence (L={L}): max_err={ssd_err:.3e} -> PASS")
+    # 2. Verify NO hard beta_R > beta_G > beta_B clamp (green coastal water validity)
+    raw_green = torch.tensor([[[[-1.0]], [[2.0]], [[0.5]]]], device=device)  # G > B > R
+    bounded = model.physics_head._smooth_bound_beta(raw_green)
+    assert bounded[0, 1, 0, 0] > bounded[0, 2, 0, 0] > bounded[0, 0, 0, 0] > 0.0, (
+        "Smooth beta bound unexpectedly clamped channel ordering!"
+    )
+    print("            - Decoupled beta_D/beta_B free of R>G>B clamp (green coastal valid) -> PASS")
 
-    # 2. SGN permutation bijection & pre_dwconv presence
-    assert isinstance(model.scan_strategy, SemanticGuidedSingleScanStrategy), "Expected SemanticGuidedSingleScanStrategy"
-    assert hasattr(model.scan_strategy, "pre_dwconv"), "Missing 2D depthwise pre_dwconv before token reordering"
-    feat = torch.randn(2, model.encoder.feature_dim, 16, 16, device=device)
-    order, inv_order, p_flat = model.scan_strategy.compute_semantic_order(feat)
-    x_flat = feat.flatten(2).transpose(1, 2)
-    C = x_flat.shape[-1]
-    L_f = x_flat.shape[1]
-    x_perm = torch.gather(x_flat, 1, order.unsqueeze(-1).expand(2, L_f, C))
-    x_back = torch.gather(x_perm, 1, inv_order.unsqueeze(-1).expand(2, L_f, C))
-    bij_err = (x_flat - x_back).abs().max().item()
-    assert bij_err == 0.0, f"SGN permutation is not an exact bijection: {bij_err}"
-    assert torch.allclose(p_flat.sum(dim=-1), torch.ones(2, L_f, device=device), atol=1e-5)
-    print(f"            - SGN GPU permutation bijection & softmax probs: max_err={bij_err:.1e} -> PASS")
+    # 3. Verify top-5% farthest pixel veiling light anchoring
+    H_t, W_t = 20, 20  # L = 400 -> top 5% = 20 pixels
+    d_syn = torch.full((1, 1, H_t, W_t), 0.1, device=device)
+    x_syn = torch.tensor([0.9, 0.1, 0.1], device=device).view(1, 3, 1, 1).expand(1, 3, H_t, W_t).clone()
+    # Set 20 farthest pixels (5%) to known far-field veiling color [0.12, 0.68, 0.42]
+    d_syn[0, 0, 0, :] = 0.99
+    target_binf = torch.tensor([0.12, 0.68, 0.42], device=device)
+    x_syn[0, :, 0, :] = target_binf.view(3, 1)
+    est_binf = _anchor_veiling_light(x_syn, d_syn).view(3)
+    binf_err = (est_binf - target_binf).abs().max().item()
+    assert binf_err < 1e-4, f"Top-5% B_inf anchoring mismatch: {binf_err:.3e}"
+    print(f"            - Top-5% farthest pixel B_inf anchoring: max_err={binf_err:.3e} -> PASS")
 
-    # 3. Verify ASE prompt_pool & semantic_router receive non-zero gradients
+    # 4. Telescoping Beer-Lambert invariance
+    # 4a) Constant depth => delta_d == 0 and dt_phys == 0 (no hidden-state collapse!)
+    d_const = torch.full((1, 1, 16, 16), 0.75, device=device)
+    bD_const = torch.full((1, 3, 16, 16), 1.2, device=device)
+    bB_const = torch.full((1, 3, 16, 16), 0.6, device=device)
+    _, _, delta_d_c, opt_delta_c = PhysicsAttenuationScanStrategy.compute_depth_order_and_opt_delta(
+        d_const, bD_const, bB_const
+    )
+    dt_phys_c = model.mamba_corrector[0].compute_physics_dt(opt_delta_c)
+    assert delta_d_c.abs().max().item() == 0.0, "Constant depth produced non-zero delta_d!"
+    assert dt_phys_c.abs().max().item() == 0.0, "Constant depth produced non-zero dt_phys!"
+
+    # 4b) Resolution invariance: linear ramp 0.1 -> 0.9 at 8x8 (L=64) vs 16x16 (L=256)
+    def _total_dt_phys_for_size(s: int) -> torch.Tensor:
+        ramp = torch.linspace(0.1, 0.9, s * s, device=device).view(1, 1, s, s)
+        bD = torch.tensor([1.4, 0.7, 0.5], device=device).view(1, 3, 1, 1).expand(1, 3, s, s)
+        bB = torch.tensor([0.5, 0.9, 1.1], device=device).view(1, 3, 1, 1).expand(1, 3, s, s)
+        _, _, _, opt_d = PhysicsAttenuationScanStrategy.compute_depth_order_and_opt_delta(ramp, bD, bB)
+        return model.mamba_corrector[0].compute_physics_dt(opt_d).sum(dim=1)  # (1, H)
+
+    tot_64 = _total_dt_phys_for_size(8)
+    tot_256 = _total_dt_phys_for_size(16)
+    tele_err = (tot_64 - tot_256).abs().max().item()
+    assert tele_err < 1e-5, f"Telescoping Beer-Lambert invariance violated: {tele_err:.3e}"
+    print(f"            - Telescoping Beer-Lambert invariance (const=0, ramp diff={tele_err:.2e}) -> PASS")
+
+    # 5. Pseudo-Linearized Akkaynak-Treibitz Cycle Consistency Loss + non-collapse regularizer
     model.train()
     model.zero_grad(set_to_none=True)
-    inp = torch.rand(1, 3, 128, 128, device=device)
-    pred, _ = forward_model(model, inp)
-    pred.mean().backward()
-    router_grad = sum(p.grad.abs().sum().item() for p in model.scan_strategy.semantic_router.parameters() if p.grad is not None)
-    prompt_grad = sum(b.prompt_pool.grad.abs().sum().item() for b in model.mamba_corrector if b.prompt_pool.grad is not None)
-    assert router_grad > 0.0, "semantic_router received zero gradient!"
-    assert prompt_grad > 0.0, "ASE prompt_pool received zero gradient!"
-    print(f"            - End-to-end ASE gradients (router={router_grad:.2e}, prompt_pool={prompt_grad:.2e}) -> PASS")
+    inp = torch.rand(2, 3, 128, 128, device=device)
+    pred, aux = forward_model(model, inp)
+    assert aux is not None and "physics" in aux, "Training forward did not expose physics dict!"
+    phys = aux["physics"]
+    assert 0.0 <= phys["d_hat"].min().item() and phys["d_hat"].max().item() <= 1.0
+    assert (phys["beta_D"] > 0).all() and (phys["beta_B"] > 0).all()
+    assert 0.0 <= phys["B_inf"].min().item() and phys["B_inf"].max().item() <= 1.0
 
-    # 4. Verify traced JIT model works dynamically at smaller (128x128) & larger (320x320) resolutions
+    loss_phys, pstats = compute_physics_cycle_loss(pred, inp, phys, lambda_phys=0.1, lambda_noncollapse=0.01)
+    assert torch.isfinite(loss_phys).all(), "Non-finite physics cycle loss!"
+    loss_phys.backward()
+    phys_head_grad = sum(p.grad.abs().sum().item() for p in model.physics_head.parameters() if p.grad is not None)
+    assert phys_head_grad > 0.0, "MicroATHead received zero gradient from physics cycle loss!"
+
+    # Verify non-collapse regularizer penalizes beta_D == beta_B
+    eq_phys = {**{k: v.detach() for k, v in phys.items()}, "beta_B": phys["beta_D"].detach()}
+    _, eq_stats = compute_physics_cycle_loss(pred.detach(), inp, eq_phys)
+    assert eq_stats["phys_noncollapse"] > pstats["phys_noncollapse"], (
+        "Non-collapse regularizer failed to penalize beta_D == beta_B!"
+    )
+    print(
+        f"            - Akkaynak-Treibitz cycle loss + non-collapse grad={phys_head_grad:.2e} "
+        f"(sep={pstats['beta_sep']:.3f}) -> PASS"
+    )
+
+    # 6. Dynamic-shape JIT trace (traced@256, eval@128 & eval@320) & deepcopy safety post-train-forward
+    import copy
+    _ = copy.deepcopy(model)  # Must succeed cleanly without non-leaf tensors attached to self!
     model.eval()
     wrapper = TraceWrapper(model).eval()
     with torch.no_grad():
