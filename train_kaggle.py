@@ -97,8 +97,8 @@ def compute_ssim_torch(
     mu2_sq = mu2.pow(2)
     mu1_mu2 = mu1 * mu2
 
-    sigma1_sq = F.conv2d(pred * pred, window, padding=pad, groups=channels) - mu1_sq
-    sigma2_sq = F.conv2d(target * target, window, padding=pad, groups=channels) - mu2_sq
+    sigma1_sq = (F.conv2d(pred * pred, window, padding=pad, groups=channels) - mu1_sq).clamp(min=0.0)
+    sigma2_sq = (F.conv2d(target * target, window, padding=pad, groups=channels) - mu2_sq).clamp(min=0.0)
     sigma12 = F.conv2d(pred * target, window, padding=pad, groups=channels) - mu1_mu2
 
     c1 = (0.01 * data_range) ** 2
@@ -215,9 +215,29 @@ def _list_images_by_stem(directory: Path) -> Dict[str, Path]:
     return mapping
 
 
+def _resolve_leaf_image_dir(directory: Path, max_depth: int = 3) -> Path:
+    """Unwrap single-child nested directories (e.g. raw-890/raw-890/*.png) common in Kaggle zips."""
+    cur = directory
+    for _ in range(max_depth):
+        if _list_images_by_stem(cur):
+            return cur
+        subdirs = [p for p in sorted(cur.iterdir()) if p.is_dir()] if cur.is_dir() else []
+        if len(subdirs) == 1:
+            cur = subdirs[0]
+        else:
+            break
+    return cur
+
+
 def _find_best_pair_dirs(search_roots: List[Path], dataset: str) -> Tuple[Path, Path]:
-    """Automatically locate (input_dir, gt_dir) under Kaggle /kaggle/input or --data_root."""
-    candidates: List[Tuple[int, Path, Path]] = []
+    """Automatically locate (input_dir, gt_dir) under Kaggle /kaggle/input or --data_root.
+
+    Uses strict lexicographic tuple ranking so dataset identity and canonical folder names
+    always take precedence over raw image count (preventing LSUI from overriding UIEB when
+    both datasets are attached simultaneously in /kaggle/input).
+    """
+    candidates: List[Tuple[Tuple[int, int, int, int], Path, Path]] = []
+    other_dataset = "lsui" if dataset == "uieb" else "uieb"
 
     if dataset == "uieb":
         name_pairs = [
@@ -234,25 +254,53 @@ def _find_best_pair_dirs(search_roots: List[Path], dataset: str) -> Tuple[Path, 
             ("input", "reference", 70),
         ]
 
+    # Collect named directories for non-sibling fallback (e.g., separate Kaggle dataset mounts)
+    named_dirs: Dict[str, List[Path]] = {}
+
     for root in search_roots:
         if not root.exists():
             continue
         for dirpath, dirnames, _ in os.walk(root):
             base = Path(dirpath)
             lower_map = {d.lower(): base / d for d in dirnames}
+            for d_low, d_path in lower_map.items():
+                named_dirs.setdefault(d_low, []).append(d_path)
             for inp_name, gt_name, priority in name_pairs:
                 if inp_name in lower_map and gt_name in lower_map:
-                    inp_dir = lower_map[inp_name]
-                    gt_dir = lower_map[gt_name]
-                    # Bonus if path explicitly mentions dataset name
-                    path_lower = str(base).lower()
-                    bonus = 50 if dataset in path_lower else 0
-                    # Check how many paired stems exist
+                    inp_dir = _resolve_leaf_image_dir(lower_map[inp_name])
+                    gt_dir = _resolve_leaf_image_dir(lower_map[gt_name])
+                    path_lower = f"{inp_dir} {gt_dir}".lower()
+                    not_other = 0 if other_dataset in path_lower else 1
+                    matches_target = 1 if dataset in path_lower else 0
                     inp_imgs = _list_images_by_stem(inp_dir)
                     gt_imgs = _list_images_by_stem(gt_dir)
                     n_common = len(set(inp_imgs.keys()) & set(gt_imgs.keys()))
                     if n_common > 0:
-                        candidates.append((priority + bonus + min(n_common, 5000), inp_dir, gt_dir))
+                        score = (not_other, matches_target, priority, n_common)
+                        candidates.append((score, inp_dir, gt_dir))
+
+    # Non-sibling fallback (e.g., /kaggle/input/uieb-raw/raw-890 + /kaggle/input/uieb-ref/reference-890)
+    # Run whenever no high-confidence sibling candidate was found for the requested dataset.
+    has_strong_sibling = any(s[0] == 1 and s[2] >= 80 for s, _, _ in candidates)
+    if not has_strong_sibling:
+        for inp_name, gt_name, priority in name_pairs:
+            for raw_inp in named_dirs.get(inp_name, []):
+                inp_dir = _resolve_leaf_image_dir(raw_inp)
+                inp_imgs = _list_images_by_stem(inp_dir)
+                if not inp_imgs:
+                    continue
+                for raw_gt in named_dirs.get(gt_name, []):
+                    gt_dir = _resolve_leaf_image_dir(raw_gt)
+                    if inp_dir == gt_dir:
+                        continue
+                    gt_imgs = _list_images_by_stem(gt_dir)
+                    n_common = len(set(inp_imgs.keys()) & set(gt_imgs.keys()))
+                    if n_common > 0:
+                        path_lower = f"{inp_dir} {gt_dir}".lower()
+                        not_other = 0 if other_dataset in path_lower else 1
+                        matches_target = 1 if dataset in path_lower else 0
+                        score = (not_other, matches_target, priority - 10, n_common)
+                        candidates.append((score, inp_dir, gt_dir))
 
     if not candidates:
         raise FileNotFoundError(
@@ -517,7 +565,7 @@ def evaluate_loader(
 def _count_gflops(model: nn.Module, shape: Tuple[int, int, int, int], device: torch.device) -> Optional[float]:
     try:
         from torch.utils.flop_counter import FlopCounterMode
-        dummy = torch.randn(*shape, device=device)
+        dummy = torch.rand(*shape, device=device)
         wrapper = TraceWrapper(model).eval()
         with torch.no_grad(), FlopCounterMode(display=False) as fc:
             _ = wrapper(dummy)
@@ -548,7 +596,7 @@ def profile_hardware(
 
     for label, (h, w) in [("256x256", (256, 256)), ("1280x720", (720, 1280))]:
         gflops = _count_gflops(model, (1, 3, h, w), device)
-        dummy = torch.randn(1, 3, h, w, device=device)
+        dummy = torch.rand(1, 3, h, w, device=device)
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -586,14 +634,14 @@ def profile_hardware(
             "peak_vram_mb": round(peak_vram_mb, 2),
         }
 
-    # torch.jit.trace export test
+    # torch.jit.trace export test (strict check_trace=True + dynamic larger shape)
     jit_ok = False
     jit_err = None
     jit_max_diff = None
     try:
-        dummy_jit = torch.randn(1, 3, 256, 256, device=device)
+        dummy_jit = torch.rand(1, 3, 256, 256, device=device)
         eager_out = wrapper(dummy_jit)
-        traced = torch.jit.trace(wrapper, dummy_jit, check_trace=False)
+        traced = torch.jit.trace(wrapper, dummy_jit, check_trace=True)
         traced_out = traced(dummy_jit)
         jit_max_diff = float((eager_out - traced_out).abs().max().item())
         jit_ok = jit_max_diff < 1e-4
@@ -734,9 +782,10 @@ def main() -> None:
 
             # All losses computed strictly in FP32
             with torch.amp.autocast(device_type=device.type, enabled=False):
-                pred_f = pred.float().clamp(0.0, 1.0)
+                pred_raw = pred.float()
+                pred_f = pred_raw.clamp(0.0, 1.0)
                 clean_f = clean.float().clamp(0.0, 1.0)
-                loss_l1 = F.l1_loss(pred_f, clean_f)
+                loss_l1 = F.l1_loss(pred_raw, clean_f)
                 loss_ssim = 1.0 - compute_ssim_torch(pred_f, clean_f)
                 loss_percep = percep_loss_fn(pred_f, clean_f)
                 loss = loss_l1 + args.lambda_ssim * loss_ssim + args.lambda_percep * loss_percep
@@ -744,18 +793,22 @@ def main() -> None:
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss detected at epoch {epoch}, step {global_step}: {loss.item()}")
 
+            step_applied = True
             if use_amp:
+                prev_scale = scaler.get_scale()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                step_applied = scaler.get_scale() >= prev_scale
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
-            ema.update(model)
+            if step_applied:
+                ema.update(model)
             running_loss += float(loss.item())
             n_batches += 1
             global_step += 1

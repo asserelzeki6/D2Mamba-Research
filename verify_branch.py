@@ -88,11 +88,6 @@ def check_static_ast_no_cpu_heapq(model: nn.Module) -> Tuple[bool, List[str]]:
         if cls.__module__.startswith("torch."):
             continue
         try:
-            src = inspect.getsource(cls.forward)
-        except (OSError, TypeError):
-            continue
-        src = "\n".join(line[len(src) - len(src.lstrip()):] if line.strip() else "" for line in src.splitlines())
-        try:
             tree = ast.parse(inspect.cleandoc(inspect.getsource(cls.forward)))
         except Exception:
             continue
@@ -160,19 +155,56 @@ def check_forward_backward(model: nn.Module, device: torch.device, shapes: List[
     print("            - Static AST check (zero .cpu()/.numpy()/heapq in forward): PASS")
 
 
+def check_mixed_precision_autocast(model: nn.Module, device: torch.device) -> None:
+    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+    print(f"[CHECK (a-amp)] Mixed-precision autocast ({device.type}, {amp_dtype}) forward + backward:")
+    model.train()
+    x = torch.rand(2, 3, 128, 128, device=device, requires_grad=True)
+    model.zero_grad(set_to_none=True)
+    with forbid_cpu_sync_and_heapq(), torch.amp.autocast(device_type=device.type, enabled=True, dtype=amp_dtype):
+        pred, aux = forward_model(model, x)
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        assert torch.isfinite(pred.float()).all(), "Non-finite output under mixed-precision autocast!"
+        loss = pred.float().mean()
+        if aux is not None and isinstance(aux, dict):
+            phys = aux.get("physics", aux) if isinstance(aux.get("physics", None), dict) else None
+            if phys is not None:
+                for k, v in phys.items():
+                    if isinstance(v, torch.Tensor):
+                        assert v.dtype == torch.float32, f"Physics tensor '{k}' must stay FP32 under AMP, got {v.dtype}"
+                        assert torch.isfinite(v).all(), f"Non-finite physics tensor '{k}' under AMP!"
+                        loss = loss + 0.01 * v.mean()
+    loss.backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all(), "Non-finite input grad under autocast!"
+    for name, p in model.named_parameters():
+        if p.requires_grad and p.grad is not None:
+            assert torch.isfinite(p.grad).all(), f"Non-finite param grad '{name}' under autocast!"
+    print(f"            - autocast fwd+bwd finite (out dtype={pred.dtype}) -> PASS")
+
+
 def check_jit_trace(model: nn.Module, device: torch.device) -> None:
-    print("[CHECK (c)] torch.jit.trace export verification:")
+    print("[CHECK (c)] torch.jit.trace export verification (strict check_trace=True + dynamic shapes):")
     model.eval()
     wrapper = TraceWrapper(model).eval()
     x_256 = torch.rand(1, 3, 256, 256, device=device)
     with torch.no_grad(), forbid_cpu_sync_and_heapq():
         eager_256 = wrapper(x_256)
-        traced = torch.jit.trace(wrapper, x_256, check_trace=False)
+        traced = torch.jit.trace(wrapper, x_256, check_trace=True)
         traced_256 = traced(x_256)
-    diff_256 = (eager_256 - traced_256).abs().max().item()
-    assert torch.isfinite(traced_256).all(), "Non-finite values in traced output!"
-    assert diff_256 < 1e-4, f"JIT trace max diff too large: {diff_256:.3e}"
-    print(f"            - (1, 3, 256, 256) max|eager - traced| = {diff_256:.3e} -> PASS")
+        diff_256 = (eager_256 - traced_256).abs().max().item()
+        assert torch.isfinite(traced_256).all(), "Non-finite values in traced output!"
+        assert diff_256 < 1e-4, f"JIT trace max diff too large: {diff_256:.3e}"
+
+        # Dynamic batch (B=2) and BOTH smaller (128x128) & larger (320x320) resolutions
+        for label, shape in [("B=2 256x256", (2, 3, 256, 256)), ("128x128", (1, 3, 128, 128)), ("320x320", (1, 3, 320, 320))]:
+            xd = torch.rand(*shape, device=device)
+            ed = wrapper(xd)
+            td = traced(xd)
+            dd = (ed - td).abs().max().item()
+            assert td.shape == ed.shape and torch.isfinite(td).all(), f"Dynamic traced output invalid for {label}"
+            assert dd < 1e-4, f"Dynamic JIT trace mismatch at {label}: {dd:.3e}"
+            print(f"            - dynamic {label} max|eager - traced| = {dd:.3e} -> PASS")
+    print(f"            - (1, 3, 256, 256) check_trace=True max|eager - traced| = {diff_256:.3e} -> PASS")
 
 
 def check_init_ckpt_compat(scan_mode: str, device: torch.device, base_dim: int, mamba_layers: int) -> None:
@@ -210,6 +242,7 @@ def main() -> None:
 
     check_param_budget(model)
     check_forward_backward(model, device, shapes=[(1, 3, 256, 256), (1, 3, 720, 1280)])
+    check_mixed_precision_autocast(model, device)
     check_jit_trace(model, device)
     check_init_ckpt_compat(args.scan_mode, device, args.base_dim, args.mamba_layers)
     check_branch_invariants(model, device)
