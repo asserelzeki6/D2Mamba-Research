@@ -282,23 +282,24 @@ class FourierPhaseAmplitudeGate(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
+        w_dtype = self.phase_enc[0].weight.dtype
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
             x_f = x.float()
             amp, log_amp, cos_p, sin_p = _rfft2_decompose_fp32(x_f)
 
-            phase_in = torch.cat([cos_p, sin_p], dim=1)
+            phase_in = torch.cat([cos_p, sin_p], dim=1).to(w_dtype)
             phase_ctx = self.phase_enc(phase_in)
-            amp_ctx = self.amp_enc(log_amp)
+            amp_ctx = self.amp_enc(log_amp.to(w_dtype))
 
             # 1. Phase-to-Amplitude Cross-Gating (strictly positive bounded multiplicative gain)
             g_p2a = self.p2a_gate(phase_ctx)
-            d_amp = torch.tanh(self.amp_delta(amp_ctx * g_p2a))
+            d_amp = torch.tanh(self.amp_delta(amp_ctx * g_p2a).float())
             amp_gain = torch.exp(torch.clamp(self.amp_scale.float() * d_amp, min=-1.5, max=1.5))
             amp_out = amp * amp_gain
 
             # 2. Amplitude-to-Phase Cross-Gating (unit-circle re-normalized phasor update)
             g_a2p = self.a2p_gate(amp_ctx)
-            d_ri = torch.tanh(self.phase_delta(phase_ctx * g_a2p))
+            d_ri = torch.tanh(self.phase_delta(phase_ctx * g_a2p).float())
             d_cos, d_sin = d_ri.chunk(2, dim=1)
             s_p = self.phase_scale.float()
             p_re = cos_p + s_p * d_cos
@@ -309,7 +310,7 @@ class FourierPhaseAmplitudeGate(nn.Module):
 
             # 3. Dynamic-shape inverse 2D real FFT + residual projection
             x_rec = _irfft2_reconstruct_fp32(amp_out, cos_out, sin_out, x_f)
-            delta = self.out_proj(x_rec) * self.res_scale.float()
+            delta = self.out_proj(x_rec.to(w_dtype)).float() * self.res_scale.float()
 
         return x + delta.to(orig_dtype)
 
@@ -538,12 +539,13 @@ class MicroATHead(nn.Module):
         H_f, W_f = features.shape[-2:]
         x_low = F.interpolate(x_rgb, size=(H_f, W_f), mode="bilinear", align_corners=False)
         h = self.fuse(torch.cat([self.feat_proj(features), self.rgb_stem(x_low)], dim=1))
-        # Strict FP32 for physics outputs (safe under --amp; cast h to float32 before FP32 head convs)
+        # Strict FP32 for physics outputs (safe under --amp and pure .half()/.bfloat16() models)
+        w_dtype = self.depth_head.weight.dtype
         with torch.amp.autocast(device_type=x_rgb.device.type, enabled=False):
-            h_f = h.float()
-            d_hat = torch.sigmoid(self.depth_head(h_f))
-            beta_D = self._smooth_bound_beta(self.beta_D_head(h_f))
-            beta_B = self._smooth_bound_beta(self.beta_B_head(h_f))
+            h_w = h.to(w_dtype)
+            d_hat = torch.sigmoid(self.depth_head(h_w).float())
+            beta_D = self._smooth_bound_beta(self.beta_D_head(h_w).float())
+            beta_B = self._smooth_bound_beta(self.beta_B_head(h_w).float())
             B_inf = _anchor_veiling_light(x_low.float(), d_hat)
         return d_hat, beta_D, beta_B, B_inf
 

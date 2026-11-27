@@ -157,29 +157,31 @@ def check_forward_backward(model: nn.Module, device: torch.device, shapes: List[
 
 def check_mixed_precision_autocast(model: nn.Module, device: torch.device) -> None:
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
-    print(f"[CHECK (a-amp)] Mixed-precision autocast ({device.type}, {amp_dtype}) forward + backward:")
+    print(f"[CHECK (a-amp)] Mixed-precision autocast ({device.type}, {amp_dtype}) forward + backward (pow2 + non-pow2 + odd):")
     model.train()
-    x = torch.rand(2, 3, 128, 128, device=device, requires_grad=True)
-    model.zero_grad(set_to_none=True)
-    with forbid_cpu_sync_and_heapq(), torch.amp.autocast(device_type=device.type, enabled=True, dtype=amp_dtype):
-        pred, aux = forward_model(model, x)
-    with torch.amp.autocast(device_type=device.type, enabled=False):
-        assert torch.isfinite(pred.float()).all(), "Non-finite output under mixed-precision autocast!"
-        loss = pred.float().mean()
-        if aux is not None and isinstance(aux, dict):
-            phys = aux.get("physics", aux) if isinstance(aux.get("physics", None), dict) else None
-            if phys is not None:
-                for k, v in phys.items():
-                    if isinstance(v, torch.Tensor):
-                        assert v.dtype == torch.float32, f"Physics tensor '{k}' must stay FP32 under AMP, got {v.dtype}"
-                        assert torch.isfinite(v).all(), f"Non-finite physics tensor '{k}' under AMP!"
-                        loss = loss + 0.01 * v.mean()
-    loss.backward()
-    assert x.grad is not None and torch.isfinite(x.grad).all(), "Non-finite input grad under autocast!"
-    for name, p in model.named_parameters():
-        if p.requires_grad and p.grad is not None:
-            assert torch.isfinite(p.grad).all(), f"Non-finite param grad '{name}' under autocast!"
-    print(f"            - autocast fwd+bwd finite (out dtype={pred.dtype}) -> PASS")
+    for shape in [(2, 3, 128, 128), (1, 3, 198, 314), (1, 3, 127, 129)]:
+        x = torch.rand(*shape, device=device, requires_grad=True)
+        model.zero_grad(set_to_none=True)
+        with forbid_cpu_sync_and_heapq(), torch.amp.autocast(device_type=device.type, enabled=True, dtype=amp_dtype):
+            pred, aux = forward_model(model, x)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            assert pred.shape == shape, f"Expected output shape {shape} under AMP, got {tuple(pred.shape)}"
+            assert torch.isfinite(pred.float()).all(), f"Non-finite output under mixed-precision autocast at {shape}!"
+            loss = pred.float().mean()
+            if aux is not None and isinstance(aux, dict):
+                phys = aux.get("physics", aux) if isinstance(aux.get("physics", None), dict) else None
+                if phys is not None:
+                    for k, v in phys.items():
+                        if isinstance(v, torch.Tensor):
+                            assert v.dtype == torch.float32, f"Physics tensor '{k}' must stay FP32 under AMP, got {v.dtype}"
+                            assert torch.isfinite(v).all(), f"Non-finite physics tensor '{k}' under AMP at {shape}!"
+                            loss = loss + 0.01 * v.mean()
+        loss.backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all(), f"Non-finite input grad under autocast at {shape}!"
+        for name, p in model.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                assert torch.isfinite(p.grad).all(), f"Non-finite param grad '{name}' under autocast at {shape}!"
+        print(f"            - shape={shape} autocast fwd+bwd finite (out dtype={pred.dtype}) -> PASS")
 
 
 def check_jit_trace(model: nn.Module, device: torch.device) -> None:
@@ -354,7 +356,7 @@ def check_branch_invariants(model: nn.Module, device: torch.device) -> None:
     assert ref_grad > 0.0, "GBPhaseRedRefiner received zero gradient!"
     print(f"            - GBPhaseRedRefiner (G/B preserved exact=0.0, R grad={ref_grad:.2e}) -> PASS")
 
-    # 7. Telescoping Beer-Lambert & Akkaynak-Treibitz cycle loss check
+    # 7. Telescoping Beer-Lambert, Akkaynak-Treibitz cycle loss & 100% trainable param grad coverage
     d_const = torch.full((1, 1, 16, 16), 0.75, device=device)
     bD_c = torch.full((1, 3, 16, 16), 1.2, device=device)
     bB_c = torch.full((1, 3, 16, 16), 0.6, device=device)
@@ -363,35 +365,67 @@ def check_branch_invariants(model: nn.Module, device: torch.device) -> None:
     model.train()
     model.zero_grad(set_to_none=True)
     inp = torch.rand(2, 3, 128, 128, device=device)
+    tgt = torch.rand(2, 3, 128, 128, device=device)
     pred, aux = forward_model(model, inp)
     loss_phys, _ = compute_physics_cycle_loss(pred, inp, aux["physics"])
-    assert torch.isfinite(loss_phys).all()
-    loss_phys.backward()
-    print("            - Telescoping Beer-Lambert & Akkaynak-Treibitz cycle loss -> PASS")
+    loss_total = torch.nn.functional.l1_loss(pred, tgt) + loss_phys
+    assert torch.isfinite(loss_total).all()
+    loss_total.backward()
+    zero_grad_params = [
+        n for n, p in model.named_parameters()
+        if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all() or p.grad.abs().sum().item() == 0.0)
+    ]
+    total_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    assert not zero_grad_params, f"Missing/zero/non-finite gradients in params: {zero_grad_params}"
+    print(f"            - Telescoping Beer-Lambert, AT cycle loss & 100% grad coverage ({total_trainable}/{total_trainable}) -> PASS")
 
-    # 8. Fused model torch.jit.trace (check_trace=True) + dynamic smaller/larger/non-pow2/odd resolutions
+    # 8. Pure FP16 (.half()) (& BF16 when hardware supports it) end-to-end fused inference on non-pow2 & odd shapes
+    low_dtypes = [("fp16", torch.float16)]
+    if device.type != "cuda" or torch.cuda.is_bf16_supported():
+        low_dtypes.append(("bf16", torch.bfloat16))
+    with torch.no_grad():
+        for dt_name, dt in low_dtypes:
+            m_low = copy.deepcopy(m_copy).to(device=device, dtype=dt).eval()
+            for res in [(198, 314), (127, 129)]:
+                x_low = torch.rand(1, 3, res[0], res[1], device=device, dtype=dt)
+                y_low, _, phys_low = m_low(x_low)
+                assert y_low.dtype == dt and y_low.shape == x_low.shape and torch.isfinite(y_low.float()).all(), (
+                    f"Pure {dt_name} fused inference failed at {res}"
+                )
+                for pk, pv in phys_low.items():
+                    assert pv.dtype == torch.float32 and torch.isfinite(pv).all(), (
+                        f"Physics '{pk}' must remain finite FP32 under pure {dt_name}"
+                    )
+    tested_dt_str = "/".join(n for n, _ in low_dtypes)
+    print(f"            - Pure {tested_dt_str} fused end-to-end (198x314, 127x129) -> PASS")
+
+    # 9. Fused model torch.jit.trace (check_trace=True) + save/load roundtrip + dynamic resolutions
+    import tempfile
     wrapper = TraceWrapper(m_copy).eval()
     with torch.no_grad():
         traced = torch.jit.trace(wrapper, x_full, check_trace=True)
         diff_256 = (wrapper(x_full) - traced(x_full)).abs().max().item()
         assert diff_256 < 1e-4, f"Fused JIT trace mismatch at 256x256: {diff_256:.3e}"
-        dyn_msgs = []
-        for lbl, shp in [
-            ("B=2 256x256", (2, 3, 256, 256)),
-            ("128x128", (1, 3, 128, 128)),
-            ("198x314", (1, 3, 198, 314)),
-            ("127x129", (1, 3, 127, 129)),
-            ("320x384", (1, 3, 320, 384)),
-        ]:
-            xd = torch.rand(*shp, device=device)
-            ed = wrapper(xd)
-            td = traced(xd)
-            dd = (ed - td).abs().max().item()
-            assert td.shape == ed.shape and dd < 1e-4, f"Fused dynamic JIT mismatch at {lbl}: {dd:.3e}"
-            dyn_msgs.append(f"{lbl}={dd:.2e}")
-    print(f"            - Fused model JIT trace (check_trace=True, 256={diff_256:.2e}, {', '.join(dyn_msgs)}) -> PASS")
+        with tempfile.NamedTemporaryFile(suffix=".pt") as tmp_jit:
+            torch.jit.save(traced, tmp_jit.name)
+            traced_loaded = torch.jit.load(tmp_jit.name, map_location=device)
+            dyn_msgs = []
+            for lbl, shp in [
+                ("B=2 256x256", (2, 3, 256, 256)),
+                ("128x128", (1, 3, 128, 128)),
+                ("198x314", (1, 3, 198, 314)),
+                ("127x129", (1, 3, 127, 129)),
+                ("320x384", (1, 3, 320, 384)),
+            ]:
+                xd = torch.rand(*shp, device=device)
+                ed = wrapper(xd)
+                td = traced_loaded(xd)
+                dd = (ed - td).abs().max().item()
+                assert td.shape == ed.shape and dd < 1e-4, f"Fused JIT load dynamic mismatch at {lbl}: {dd:.3e}"
+                dyn_msgs.append(f"{lbl}={dd:.2e}")
+    print(f"            - Fused JIT trace + save/load roundtrip (256={diff_256:.2e}, {', '.join(dyn_msgs)}) -> PASS")
 
-    # 9. GFLOPs budget report (fused model at 256x256)
+    # 10. GFLOPs budget report (fused model at 256x256)
     gflops_256 = _count_gflops(m_copy, (1, 3, 256, 256), device)
     if gflops_256 is not None:
         print(f"            - Fused GFLOPs @ 256x256: {gflops_256:.3f} GFLOPs -> PASS")
