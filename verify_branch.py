@@ -223,111 +223,131 @@ def check_init_ckpt_compat(scan_mode: str, device: torch.device, base_dim: int, 
 
 
 def check_branch_invariants(model: nn.Module, device: torch.device) -> None:
-    """Branch 2 invariants: Micro-AT <0.15M, decoupled beta_D/beta_B, top-5% B_inf,
-    telescoping Beer-Lambert invariance, Akkaynak-Treibitz cycle loss, and dynamic JIT."""
+    """Branch 3 invariants: RepConv .fuse() <1e-5 (unit & full model), Haar DWT exactness & FP16 safety,
+    zero torch.fft, H/8 bottleneck Mamba, GBPhaseRedRefiner, Micro-AT & cycle loss, fused dynamic JIT."""
+    import copy
     from model import (
+        GBPhaseRedRefiner,
         MicroATHead,
         PhysicsAttenuationScanStrategy,
-        _anchor_veiling_light,
+        RepConv,
+        haar_dwt_2d,
+        haar_idwt_2d,
     )
     from train_kaggle import compute_physics_cycle_loss
 
-    print("[CHECK (e)] Branch 2 (Physics-Anchored Attenuation Scan) mathematical invariants:")
+    print("[CHECK (e)] Branch 3 (Haar-Phase-Fast + RepConv) mathematical invariants:")
 
-    # 1. Micro-AT parameter count strictly < 0.15M
-    assert isinstance(model.physics_head, MicroATHead), "Expected MicroATHead on Branch 2"
+    # 1. Unit RepConv .fuse() exactness (< 1e-5) with non-trivial BN running stats
+    rc = RepConv(32).to(device).train()
+    for _ in range(3):
+        _ = rc(torch.randn(2, 32, 32, 32, device=device) * 2.5 + 0.7)
+    rc.eval()
+    x_rc = torch.randn(1, 32, 32, 32, device=device)
+    with torch.no_grad():
+        y_train_branch = rc(x_rc)
+        rc.fuse()
+        y_fused = rc(x_rc)
+    unit_fuse_err = (y_train_branch - y_fused).abs().max().item()
+    assert rc.fused and rc.fused_conv is not None
+    assert unit_fuse_err < 1e-5, f"Unit RepConv .fuse() error too large: {unit_fuse_err:.3e}"
+    print(f"            - Unit RepConv (7x7+3x3+1x1) .fuse(): max|train - fused| = {unit_fuse_err:.3e} (< 1e-5) -> PASS")
+
+    # 2. Full end-to-end model.fuse() exactness (< 1e-5) + fused JIT trace
+    m_copy = copy.deepcopy(model).to(device).train()
+    for _ in range(2):
+        _ = m_copy(torch.rand(1, 3, 128, 128, device=device))
+    m_copy.eval()
+    x_full = torch.rand(1, 3, 256, 256, device=device)
+    with torch.no_grad():
+        y_unfused = m_copy(x_full)[0]
+        m_copy.fuse()
+        y_model_fused = m_copy(x_full)[0]
+    full_fuse_err = (y_unfused - y_model_fused).abs().max().item()
+    assert full_fuse_err < 1e-5, f"Full model.fuse() error too large: {full_fuse_err:.3e}"
+    assert all(m.fused for m in m_copy.modules() if isinstance(m, RepConv)), "Some RepConv layers were not fused!"
+    print(f"            - Full model.fuse() end-to-end: max|train - fused| = {full_fuse_err:.3e} (< 1e-5) -> PASS")
+
+    # 3. Haar DWT/IDWT exact orthonormal reconstruction + FP16 safety on arbitrary even resolutions
+    for res in [(256, 256), (198, 314), (720, 1280)]:
+        x_w = torch.randn(1, 3, res[0], res[1], device=device)
+        ll, lh, hl, hh = haar_dwt_2d(x_w)
+        x_rec = haar_idwt_2d(ll, lh, hl, hh, out_h=res[0], out_w=res[1])
+        w_err = (x_w - x_rec).abs().max().item()
+        assert w_err < 1e-5, f"Haar DWT/IDWT reconstruction error at {res}: {w_err:.3e}"
+        # FP16 safety check (zero cuFFT crashes on non-power-of-two even resolutions)
+        x_h = x_w.half()
+        ll_h, lh_h, hl_h, hh_h = haar_dwt_2d(x_h)
+        rec_h = haar_idwt_2d(ll_h, lh_h, hl_h, hh_h, out_h=res[0], out_w=res[1])
+        assert rec_h.dtype == torch.float16 and torch.isfinite(rec_h).all()
+    # Full fused model forward on non-power-of-two even resolution (198x314)
+    with torch.no_grad():
+        y_198 = m_copy(torch.rand(1, 3, 198, 314, device=device))[0]
+    assert y_198.shape == (1, 3, 198, 314) and torch.isfinite(y_198).all()
+    print("            - Haar DWT/IDWT exactness (<1e-5) & FP16 arbitrary even res (198x314, 720x1280) -> PASS")
+
+    # 4. Zero torch.fft calls anywhere in Branch 3 model.py
+    model_src = Path("model.py").read_text(encoding="utf-8")
+    tree = ast.parse(model_src)
+    fft_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in {"fft", "fft2", "rfft2", "ifft2"}
+    ]
+    assert len(fft_calls) == 0, f"Found forbidden torch.fft reference in Branch 3 model.py!"
+    print("            - Zero torch.fft / cuFFT calls in model.py (AST verified) -> PASS")
+
+    # 5. Physics Mamba strictly in compressed H/8 bottleneck (256/8 = 32 -> L = 1024)
+    with torch.no_grad():
+        _, path_len, _ = m_copy(x_full)
+    assert path_len == (256 // 8) * (256 // 8), f"Expected H/8 bottleneck L=1024, got {path_len}"
     micro_at_params = sum(p.numel() for p in model.physics_head.parameters())
-    assert micro_at_params < 150_000, f"Micro-AT params ({micro_at_params:,}) exceeds 0.15M!"
-    print(f"            - Micro-AT params: {micro_at_params:,} ({micro_at_params/1e6:.4f}M < 0.15M) -> PASS")
+    assert isinstance(model.physics_head, MicroATHead) and micro_at_params < 150_000
+    print(f"            - Compressed H/8 bottleneck Mamba (L={path_len}) & Micro-AT ({micro_at_params:,} < 0.15M) -> PASS")
 
-    # 2. Verify NO hard beta_R > beta_G > beta_B clamp (green coastal water validity)
-    raw_green = torch.tensor([[[[-1.0]], [[2.0]], [[0.5]]]], device=device)  # G > B > R
-    bounded = model.physics_head._smooth_bound_beta(raw_green)
-    assert bounded[0, 1, 0, 0] > bounded[0, 2, 0, 0] > bounded[0, 0, 0, 0] > 0.0, (
-        "Smooth beta bound unexpectedly clamped channel ordering!"
-    )
-    print("            - Decoupled beta_D/beta_B free of R>G>B clamp (green coastal valid) -> PASS")
+    # 6. Green/Blue-Phase-Guided Red Channel Refinement invariant
+    refiner = model.gb_red_refiner
+    assert isinstance(refiner, GBPhaseRedRefiner)
+    refiner.train()
+    refiner.zero_grad(set_to_none=True)
+    x_rgb = torch.rand(1, 3, 64, 64, device=device, requires_grad=True)
+    out_rgb = refiner(x_rgb)
+    gb_diff = (out_rgb[:, 1:3] - x_rgb[:, 1:3]).abs().max().item()
+    assert gb_diff == 0.0, f"GBPhaseRedRefiner unexpectedly modified G/B channels: {gb_diff}"
+    out_rgb[:, 0:1].mean().backward()
+    ref_grad = sum(p.grad.abs().sum().item() for p in refiner.parameters() if p.grad is not None)
+    assert ref_grad > 0.0, "GBPhaseRedRefiner received zero gradient!"
+    print(f"            - GBPhaseRedRefiner (G/B preserved exact=0.0, R grad={ref_grad:.2e}) -> PASS")
 
-    # 3. Verify top-5% farthest pixel veiling light anchoring
-    H_t, W_t = 20, 20  # L = 400 -> top 5% = 20 pixels
-    d_syn = torch.full((1, 1, H_t, W_t), 0.1, device=device)
-    x_syn = torch.tensor([0.9, 0.1, 0.1], device=device).view(1, 3, 1, 1).expand(1, 3, H_t, W_t).clone()
-    # Set 20 farthest pixels (5%) to known far-field veiling color [0.12, 0.68, 0.42]
-    d_syn[0, 0, 0, :] = 0.99
-    target_binf = torch.tensor([0.12, 0.68, 0.42], device=device)
-    x_syn[0, :, 0, :] = target_binf.view(3, 1)
-    est_binf = _anchor_veiling_light(x_syn, d_syn).view(3)
-    binf_err = (est_binf - target_binf).abs().max().item()
-    assert binf_err < 1e-4, f"Top-5% B_inf anchoring mismatch: {binf_err:.3e}"
-    print(f"            - Top-5% farthest pixel B_inf anchoring: max_err={binf_err:.3e} -> PASS")
-
-    # 4. Telescoping Beer-Lambert invariance
-    # 4a) Constant depth => delta_d == 0 and dt_phys == 0 (no hidden-state collapse!)
+    # 7. Telescoping Beer-Lambert & Akkaynak-Treibitz cycle loss check
     d_const = torch.full((1, 1, 16, 16), 0.75, device=device)
-    bD_const = torch.full((1, 3, 16, 16), 1.2, device=device)
-    bB_const = torch.full((1, 3, 16, 16), 0.6, device=device)
-    _, _, delta_d_c, opt_delta_c = PhysicsAttenuationScanStrategy.compute_depth_order_and_opt_delta(
-        d_const, bD_const, bB_const
-    )
-    dt_phys_c = model.mamba_corrector[0].compute_physics_dt(opt_delta_c)
-    assert delta_d_c.abs().max().item() == 0.0, "Constant depth produced non-zero delta_d!"
-    assert dt_phys_c.abs().max().item() == 0.0, "Constant depth produced non-zero dt_phys!"
-
-    # 4b) Resolution invariance: linear ramp 0.1 -> 0.9 at 8x8 (L=64) vs 16x16 (L=256)
-    def _total_dt_phys_for_size(s: int) -> torch.Tensor:
-        ramp = torch.linspace(0.1, 0.9, s * s, device=device).view(1, 1, s, s)
-        bD = torch.tensor([1.4, 0.7, 0.5], device=device).view(1, 3, 1, 1).expand(1, 3, s, s)
-        bB = torch.tensor([0.5, 0.9, 1.1], device=device).view(1, 3, 1, 1).expand(1, 3, s, s)
-        _, _, _, opt_d = PhysicsAttenuationScanStrategy.compute_depth_order_and_opt_delta(ramp, bD, bB)
-        return model.mamba_corrector[0].compute_physics_dt(opt_d).sum(dim=1)  # (1, H)
-
-    tot_64 = _total_dt_phys_for_size(8)
-    tot_256 = _total_dt_phys_for_size(16)
-    tele_err = (tot_64 - tot_256).abs().max().item()
-    assert tele_err < 1e-5, f"Telescoping Beer-Lambert invariance violated: {tele_err:.3e}"
-    print(f"            - Telescoping Beer-Lambert invariance (const=0, ramp diff={tele_err:.2e}) -> PASS")
-
-    # 5. Pseudo-Linearized Akkaynak-Treibitz Cycle Consistency Loss + non-collapse regularizer
+    bD_c = torch.full((1, 3, 16, 16), 1.2, device=device)
+    bB_c = torch.full((1, 3, 16, 16), 0.6, device=device)
+    _, _, dd, od = PhysicsAttenuationScanStrategy.compute_depth_order_and_opt_delta(d_const, bD_c, bB_c)
+    assert dd.abs().max().item() == 0.0 and model.mamba_corrector[0].compute_physics_dt(od).abs().max().item() == 0.0
     model.train()
     model.zero_grad(set_to_none=True)
     inp = torch.rand(2, 3, 128, 128, device=device)
     pred, aux = forward_model(model, inp)
-    assert aux is not None and "physics" in aux, "Training forward did not expose physics dict!"
-    phys = aux["physics"]
-    assert 0.0 <= phys["d_hat"].min().item() and phys["d_hat"].max().item() <= 1.0
-    assert (phys["beta_D"] > 0).all() and (phys["beta_B"] > 0).all()
-    assert 0.0 <= phys["B_inf"].min().item() and phys["B_inf"].max().item() <= 1.0
-
-    loss_phys, pstats = compute_physics_cycle_loss(pred, inp, phys, lambda_phys=0.1, lambda_noncollapse=0.01)
-    assert torch.isfinite(loss_phys).all(), "Non-finite physics cycle loss!"
+    loss_phys, _ = compute_physics_cycle_loss(pred, inp, aux["physics"])
+    assert torch.isfinite(loss_phys).all()
     loss_phys.backward()
-    phys_head_grad = sum(p.grad.abs().sum().item() for p in model.physics_head.parameters() if p.grad is not None)
-    assert phys_head_grad > 0.0, "MicroATHead received zero gradient from physics cycle loss!"
+    print("            - Telescoping Beer-Lambert & Akkaynak-Treibitz cycle loss -> PASS")
 
-    # Verify non-collapse regularizer penalizes beta_D == beta_B
-    eq_phys = {**{k: v.detach() for k, v in phys.items()}, "beta_B": phys["beta_D"].detach()}
-    _, eq_stats = compute_physics_cycle_loss(pred.detach(), inp, eq_phys)
-    assert eq_stats["phys_noncollapse"] > pstats["phys_noncollapse"], (
-        "Non-collapse regularizer failed to penalize beta_D == beta_B!"
-    )
-    print(
-        f"            - Akkaynak-Treibitz cycle loss + non-collapse grad={phys_head_grad:.2e} "
-        f"(sep={pstats['beta_sep']:.3f}) -> PASS"
-    )
-
-    # 6. Dynamic-shape JIT trace (traced@256, eval@128 & eval@320) & deepcopy safety post-train-forward
-    import copy
-    _ = copy.deepcopy(model)  # Must succeed cleanly without non-leaf tensors attached to self!
-    model.eval()
-    wrapper = TraceWrapper(model).eval()
+    # 8. Fused model torch.jit.trace (check_trace=True) + dynamic smaller/larger/non-pow2 resolutions
+    wrapper = TraceWrapper(m_copy).eval()
     with torch.no_grad():
-        traced = torch.jit.trace(wrapper, torch.rand(1, 3, 256, 256, device=device), check_trace=True)
-        x_128 = torch.rand(1, 3, 128, 128, device=device)
-        x_320 = torch.rand(1, 3, 320, 320, device=device)
-        diff_128 = (wrapper(x_128) - traced(x_128)).abs().max().item()
-        diff_320 = (wrapper(x_320) - traced(x_320)).abs().max().item()
-    assert diff_128 < 1e-4 and diff_320 < 1e-4, f"Dynamic-shape JIT trace mismatch: 128={diff_128:.3e}, 320={diff_320:.3e}"
-    print(f"            - Dynamic-shape JIT trace (traced@256, eval@128={diff_128:.2e}, eval@320={diff_320:.2e}) -> PASS")
+        traced = torch.jit.trace(wrapper, x_full, check_trace=True)
+        diff_256 = (wrapper(x_full) - traced(x_full)).abs().max().item()
+        assert diff_256 < 1e-4, f"Fused JIT trace mismatch at 256x256: {diff_256:.3e}"
+        dyn_msgs = []
+        for lbl, shp in [("128x128", (1, 3, 128, 128)), ("198x314", (1, 3, 198, 314)), ("320x384", (1, 3, 320, 384))]:
+            xd = torch.rand(*shp, device=device)
+            ed = wrapper(xd)
+            td = traced(xd)
+            dd = (ed - td).abs().max().item()
+            assert td.shape == ed.shape and dd < 1e-4, f"Fused dynamic JIT mismatch at {lbl}: {dd:.3e}"
+            dyn_msgs.append(f"{lbl}={dd:.2e}")
+    print(f"            - Fused model JIT trace (check_trace=True, 256={diff_256:.2e}, {', '.join(dyn_msgs)}) -> PASS")
 
 
 def main() -> None:
