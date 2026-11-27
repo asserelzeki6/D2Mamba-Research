@@ -392,10 +392,32 @@ class RepConv(nn.Module):
         self.fused = True
         return self
 
+    @staticmethod
+    def _run_branch(x: torch.Tensor, branch: nn.Sequential) -> torch.Tensor:
+        conv = branch[0]
+        bn = branch[1]
+        y = conv(x)
+        if bn.training:
+            return bn(y)
+        # Explicit centered (1, C, 1, 1) FP32 BN avoids PyTorch TorchScript CUDA TensorExpr
+        # aten::batch_norm fusion bug (which mis-broadcasts 1D C params against dim 3 W
+        # when fused with downstream multi-branch ops such as Haar IDWT) while avoiding
+        # catastrophic cancellation when y is close to running_mean.
+        inv_std = torch.rsqrt(bn.running_var.float() + bn.eps)
+        scale = (bn.weight.float() * inv_std).view(1, -1, 1, 1)
+        mean = bn.running_mean.float().view(1, -1, 1, 1)
+        bias = bn.bias.float().view(1, -1, 1, 1)
+        out = (y.float() - mean) * scale + bias
+        return out.to(y.dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fused and self.fused_conv is not None:
             return self.fused_conv(x)
-        return self.branch7(x) + self.branch3(x) + self.branch1(x)
+        return (
+            self._run_branch(x, self.branch7)
+            + self._run_branch(x, self.branch3)
+            + self._run_branch(x, self.branch1)
+        )
 
 
 class RepConvBlock(nn.Module):
